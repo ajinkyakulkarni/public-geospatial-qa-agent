@@ -340,14 +340,34 @@ def _derive_args_from_query(query: str) -> dict[str, str]:
     return {"datetime": dt, "place": place}
 
 
-def needs_clarification(query: str) -> str | None:
-    """Return a follow-up question if the query is missing a date range
-    or a place; otherwise None.
+CLARIFY_SYS_PROMPT = (
+    "You are a query intake assistant for an Earth-observation Q&A agent. "
+    "The downstream agent answers questions about which datasets cover a "
+    "place over a time window, then summarises catalog items in that area. "
+    "Decide whether the user query has all three of: "
+    "(a) AN EXPLICIT TIME REFERENCE — a year, month, season, or date range. "
+    "Words like 'recent', 'latest', or 'now' do NOT count. "
+    "(b) A PLACE — a city, county, state, country, region, or bbox. "
+    "(c) A DATASET HINT — either a variable name (NO2, NDVI, SST, methane, "
+    "precipitation, sea ice, land cover, etc.) or a collection name. "
+    "If ANY of the three is missing, respond with exactly one short follow-up "
+    "question asking for what is missing. Be terse — one sentence, no preamble. "
+    "If all three are present, respond with the literal token OK and nothing "
+    "else. Examples:\n"
+    "  User: 'Show NO2 over Houston'                  → 'What time window?'\n"
+    "  User: 'Show NO2 over Houston for 2021'         → 'OK'\n"
+    "  User: 'Show air quality data for LA County'    → 'What time window?'\n"
+    "  User: 'What datasets do you have for NO2'      → 'What region and time window?'\n"
+    "  User: 'NO2 in California for last year'        → 'What specific year? Last year is ambiguous.'\n"
+    "Do not call any tools. Do not add explanations or pleasantries."
+)
 
-    The check is rule-based on purpose — it should be cheap, predictable,
-    and have an off switch. An LLM-based intent extractor would be more
-    forgiving but adds an extra billable call per turn before the cycle
-    even starts.
+
+def needs_clarification(query: str) -> str | None:
+    """Cheap rule-based fallback used when no OpenAI client is available
+    (offline tests, dry runs). Returns a question or None. The web UI
+    and run-corpus prefer llm_clarification_check, which is more
+    forgiving and measurable.
     """
     import re
     has_year = bool(re.search(_YEAR_RX, query))
@@ -366,3 +386,77 @@ def needs_clarification(query: str) -> str | None:
     if not has_place:
         return "What place should I search? A city, county, or region works."
     return None
+
+
+@dataclass
+class ClarifyResult:
+    """One LLM clarification call's worth of state. Surfaces the
+    question (or None if the query was OK), plus the cost and token
+    telemetry so corpus runs can report the clarify-cost separately
+    from the cycle cost."""
+    question: str | None
+    prompt_tokens: int = 0
+    cached_tokens: int = 0
+    completion_tokens: int = 0
+    cost_usd: float = 0.0
+    openai_response_id: str = ""
+
+
+def llm_clarification_check(
+    client: OpenAI,
+    query: str,
+    *,
+    model: str = "gpt-5.2",
+    rate: RateCard = GPT_5_2_STANDARD,
+    prompt_cache_key: str = "public-geospatial-qa-agent-clarify",
+) -> ClarifyResult:
+    """One small LLM call that decides whether to ask back.
+
+    Returns ClarifyResult.question = None when the query has enough
+    context to proceed; otherwise a single short follow-up question.
+    Either way, the call's token counts and cost are recorded so the
+    corpus aggregator can report clarification overhead.
+    """
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": CLARIFY_SYS_PROMPT},
+                {"role": "user", "content": query},
+            ],
+            extra_body={"prompt_cache_key": prompt_cache_key},
+            max_completion_tokens=80,
+        )
+    except Exception as e:
+        # If the gate call fails (rate-limit, auth, network), let the
+        # downstream cycle run rather than blocking the user. Record
+        # zero cost so corpus runs don't penalise a transient failure.
+        return ClarifyResult(question=None, openai_response_id=f"error:{type(e).__name__}")
+
+    msg = (response.choices[0].message.content or "").strip()
+    usage = response.usage
+    prompt_tokens = usage.prompt_tokens
+    cached_tokens = (
+        usage.prompt_tokens_details.cached_tokens
+        if usage.prompt_tokens_details else 0
+    )
+    completion_tokens = usage.completion_tokens
+    cost = cost_for_call(rate, prompt_tokens, cached_tokens, completion_tokens)
+
+    # The system prompt asks for exactly "OK" when no follow-up is
+    # needed. Tolerate trailing punctuation / quoting / model gloss
+    # ("OK.", "OK\n", "Sure, OK").
+    is_ok = (
+        msg.upper().startswith("OK")
+        and len(msg) <= 4
+    ) or msg.upper().strip(" .\"'") == "OK"
+    question = None if is_ok else msg
+
+    return ClarifyResult(
+        question=question,
+        prompt_tokens=prompt_tokens,
+        cached_tokens=cached_tokens,
+        completion_tokens=completion_tokens,
+        cost_usd=cost,
+        openai_response_id=getattr(response, "id", "") or "",
+    )

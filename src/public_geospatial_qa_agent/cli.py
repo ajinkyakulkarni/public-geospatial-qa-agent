@@ -43,9 +43,15 @@ from openai import OpenAI
 from . import __version__
 from .archetypes import ALL_ARCHETYPES, archetype_by_id
 from .backends import make_backend
+from .corpus import CorpusQuery, load_corpus
 from .cost import GPT_5_2_STANDARD, monthly_extrapolation
 from .instrumentation import JsonlLogger
-from .runner import load_sysprompt, load_tool_schemas, run_cycle
+from .runner import (
+    llm_clarification_check,
+    load_sysprompt,
+    load_tool_schemas,
+    run_cycle,
+)
 
 
 def cmd_show_config(args: argparse.Namespace) -> int:
@@ -187,6 +193,111 @@ def cmd_run_suite(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run_corpus(args: argparse.Namespace) -> int:
+    """Run the hand-curated query corpus through one or both modes.
+
+    Writes one JSONL line per LLM call into the log path. Each record
+    includes the corpus query id so analyze --corpus can slice by
+    shape / place_size / dataset_family.
+    """
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        print("ERROR: OPENAI_API_KEY not set in environment.", file=sys.stderr)
+        return 2
+    client = OpenAI(api_key=api_key)
+    backend = make_backend(args.backend)
+    corpus = load_corpus()
+    if args.limit:
+        corpus = corpus[: args.limit]
+
+    log_path = Path(args.log)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.unlink(missing_ok=True)
+
+    modes = ["templated", "freeform"] if args.modes == "both" else [args.modes]
+    n_total = len(corpus) * args.samples * len(modes)
+    n_done = 0
+    spend = 0.0
+
+    # Clarify-call cost is logged into the same JSONL but tagged with
+    # stage_name="clarify_check" + stage_idx=0 so analyze can split it
+    # out of the cycle aggregates.
+    clarify_records: list[dict] = []
+
+    print(f"Running {n_total} cycles ({len(corpus)} queries × {args.samples} "
+          f"samples × {len(modes)} modes). Budget cap: ${args.budget:.2f}. "
+          f"Log: {log_path}. Backend: {args.backend}. "
+          f"Clarify gate: {'on' if args.clarify else 'off'}.")
+    print()
+
+    with JsonlLogger(log_path) as logger:
+        for cq in corpus:
+            # One clarify call per query is enough — same query yields
+            # the same decision; do not pay it per sample/mode.
+            clarify_result = None
+            if args.clarify:
+                clarify_result = llm_clarification_check(client, cq.query)
+                clarify_records.append({
+                    "query_id": cq.id, "shape": cq.shape,
+                    "place_size": cq.place_size,
+                    "dataset_family": cq.dataset_family,
+                    "clarify_question": clarify_result.question,
+                    "clarify_prompt_tokens": clarify_result.prompt_tokens,
+                    "clarify_cached_tokens": clarify_result.cached_tokens,
+                    "clarify_completion_tokens": clarify_result.completion_tokens,
+                    "clarify_cost_usd": round(clarify_result.cost_usd, 6),
+                    "clarify_response_id": clarify_result.openai_response_id,
+                })
+                spend += clarify_result.cost_usd
+
+            archetype = archetype_by_id(cq.shape)
+            for sample_idx in range(args.samples):
+                for mode in modes:
+                    n_done += 1
+                    label = (
+                        f"  [{n_done}/{n_total}] {cq.id}/{mode}/s{sample_idx + 1}"
+                    )
+                    print(f"{label} (spend so far ${spend:.4f})…")
+                    session_id = f"{cq.id}-{mode}-s{sample_idx + 1}"
+                    trace = run_cycle(
+                        client, archetype, mode,
+                        session_id=session_id,
+                        user_query=cq.query,
+                        logger=logger,
+                        backend=backend,
+                    )
+                    spend += trace.total_cost_usd
+                    if spend > args.budget:
+                        print(f"  !! Budget cap ${args.budget} hit. Stopping.")
+                        print(f"  Final spend: ${spend:.4f}")
+                        return _write_corpus_meta(log_path, corpus, clarify_records, spend)
+
+    return _write_corpus_meta(log_path, corpus, clarify_records, spend)
+
+
+def _write_corpus_meta(log_path: Path, corpus: list[CorpusQuery],
+                       clarify_records: list[dict], spend: float) -> int:
+    """Write the per-query metadata + per-clarify-call records next to
+    the JSONL. analyze --corpus reads both."""
+    meta = {
+        "spend_usd": round(spend, 6),
+        "queries": [
+            {"id": q.id, "shape": q.shape, "place_size": q.place_size,
+             "dataset_family": q.dataset_family, "query": q.query}
+            for q in corpus
+        ],
+        "clarify": clarify_records,
+    }
+    meta_path = log_path.with_suffix(".meta.json")
+    meta_path.write_text(json.dumps(meta, indent=2))
+    print()
+    print(f"Done. Total spend: ${spend:.4f}.")
+    print(f"  Log:  {log_path}")
+    print(f"  Meta: {meta_path}")
+    print(f"Run `public-geospatial-qa-agent analyze --corpus --log {log_path}` for aggregates.")
+    return 0
+
+
 def cmd_analyze(args: argparse.Namespace) -> int:
     """Aggregate a JSONL log into per-stage cache shares + cost
     projections. Read-only, no API calls."""
@@ -200,6 +311,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     if not records:
         print("ERROR: log file is empty.", file=sys.stderr)
         return 1
+
+    if args.corpus:
+        return _analyze_corpus(path, records, args)
 
     from collections import defaultdict
     import statistics
@@ -247,6 +361,146 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def _analyze_corpus(log_path: Path, records: list[dict],
+                    args: argparse.Namespace) -> int:
+    """Per-axis aggregate report. Mean per-cycle cost + 95% CI broken
+    down by archetype shape, by place_size, and by dataset_family.
+    Emits a Markdown file next to the JSONL so the paper can include
+    it directly."""
+    import statistics
+    import math
+    from collections import defaultdict
+
+    meta_path = log_path.with_suffix(".meta.json")
+    if not meta_path.exists():
+        print(f"ERROR: {meta_path} not found. Did you run via run-corpus?",
+              file=sys.stderr)
+        return 1
+    meta = json.loads(meta_path.read_text())
+    query_meta = {q["id"]: q for q in meta["queries"]}
+
+    # Each session_id is "<query_id>-<mode>-s<n>". Group records by
+    # session, then sum per-session cost / tokens. Per-session
+    # aggregates are what we average across the corpus.
+    by_session: dict[str, list[dict]] = defaultdict(list)
+    for r in records:
+        by_session[r["session_id"]].append(r)
+
+    rows = []
+    for sid, recs in by_session.items():
+        if "-" not in sid:
+            continue
+        # session_id shape: <qid>-<mode>-sN
+        parts = sid.rsplit("-", 2)
+        if len(parts) != 3:
+            continue
+        qid, mode, _sample = parts
+        if qid not in query_meta:
+            continue
+        cycle_cost = sum(r["call_cost_usd"] for r in recs)
+        cycle_in = sum(r["prompt_tokens"] for r in recs)
+        cycle_cached = sum(r["cached_tokens"] for r in recs)
+        cycle_out = sum(r["completion_tokens"] for r in recs)
+        qm = query_meta[qid]
+        rows.append({
+            "query_id": qid, "mode": mode,
+            "shape": qm["shape"],
+            "place_size": qm["place_size"],
+            "dataset_family": qm["dataset_family"],
+            "cycle_cost_usd": cycle_cost,
+            "cycle_prompt_tokens": cycle_in,
+            "cycle_cached_tokens": cycle_cached,
+            "cycle_completion_tokens": cycle_out,
+            "cache_ratio": cycle_cached / cycle_in if cycle_in else 0,
+        })
+
+    def mean_ci(values: list[float]) -> tuple[float, float]:
+        if len(values) < 2:
+            return (statistics.mean(values) if values else 0.0, 0.0)
+        m = statistics.mean(values)
+        s = statistics.stdev(values)
+        # 95% CI for the mean, normal approximation. Adequate for N>=10.
+        ci = 1.96 * s / math.sqrt(len(values))
+        return m, ci
+
+    md = ["# Corpus aggregate", ""]
+    md.append(f"Source: `{log_path.name}` ({len(records)} LLM calls across "
+              f"{len(by_session)} cycles).")
+    md.append(f"Total spend: ${meta['spend_usd']:.4f}.")
+    md.append("")
+
+    # ---- Table 8: per-shape mean + 95% CI ----
+    md.append("## Per-archetype-shape per-cycle cost (mean ± 95% CI)")
+    md.append("")
+    md.append("| shape | mode | n | cost ($) | cache % | prompt tok | output tok |")
+    md.append("|---|---|---:|---:|---:|---:|---:|")
+    by_shape_mode: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for r in rows:
+        by_shape_mode[(r["shape"], r["mode"])].append(r)
+    for (shape, mode) in sorted(by_shape_mode):
+        rs = by_shape_mode[(shape, mode)]
+        cost_m, cost_ci = mean_ci([r["cycle_cost_usd"] for r in rs])
+        cache_m, _ = mean_ci([r["cache_ratio"] for r in rs])
+        in_m, _ = mean_ci([float(r["cycle_prompt_tokens"]) for r in rs])
+        out_m, _ = mean_ci([float(r["cycle_completion_tokens"]) for r in rs])
+        md.append(
+            f"| {shape} | {mode} | {len(rs)} | "
+            f"{cost_m:.6f} ± {cost_ci:.6f} | {100*cache_m:.1f}% | "
+            f"{in_m:,.0f} | {out_m:,.0f} |"
+        )
+    md.append("")
+
+    # ---- Table 9: per place_size ----
+    md.append("## Per-cycle cost by place size (templated)")
+    md.append("")
+    md.append("| place_size | n | cost ($) | cache % |")
+    md.append("|---|---:|---:|---:|")
+    by_psize: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        if r["mode"] != "templated":
+            continue
+        by_psize[r["place_size"]].append(r)
+    for psize in sorted(by_psize, key=lambda k: -len(by_psize[k])):
+        rs = by_psize[psize]
+        cost_m, cost_ci = mean_ci([r["cycle_cost_usd"] for r in rs])
+        cache_m, _ = mean_ci([r["cache_ratio"] for r in rs])
+        md.append(
+            f"| {psize} | {len(rs)} | "
+            f"{cost_m:.6f} ± {cost_ci:.6f} | {100*cache_m:.1f}% |"
+        )
+    md.append("")
+
+    # ---- Table 10: clarification trigger rate by shape ----
+    md.append("## Clarification trigger rate by archetype shape")
+    md.append("")
+    clarify_records = meta.get("clarify", [])
+    if not clarify_records:
+        md.append("_No clarification calls were made (gate was off)._")
+    else:
+        md.append("| shape | queries | triggered | rate | clarify cost ($) |")
+        md.append("|---|---:|---:|---:|---:|")
+        by_shape_clarify: dict[str, list[dict]] = defaultdict(list)
+        for cr in clarify_records:
+            by_shape_clarify[cr["shape"]].append(cr)
+        for shape in sorted(by_shape_clarify):
+            crs = by_shape_clarify[shape]
+            triggered = [c for c in crs if c["clarify_question"]]
+            total_cost = sum(c["clarify_cost_usd"] for c in crs)
+            md.append(
+                f"| {shape} | {len(crs)} | {len(triggered)} | "
+                f"{100*len(triggered)/len(crs):.1f}% | "
+                f"{total_cost:.6f} |"
+            )
+    md.append("")
+
+    md_path = log_path.with_suffix(".aggregate.md")
+    md_path.write_text("\n".join(md))
+    print("\n".join(md))
+    print()
+    print(f"Wrote {md_path}.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="public-geospatial-qa-agent",
@@ -279,7 +533,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     p4 = sub.add_parser("analyze", help="Aggregate a JSONL log; no API calls")
     p4.add_argument("--log", type=Path, default=Path("runs/measurement.jsonl"))
+    p4.add_argument("--corpus", action="store_true",
+                    help="Read the .meta.json sibling and emit per-axis "
+                         "aggregates (shape, place size, dataset). Use this "
+                         "after run-corpus.")
     p4.set_defaults(func=cmd_analyze)
+
+    p6 = sub.add_parser(
+        "run-corpus",
+        help="Run the hand-curated 50-query corpus from data/queries.json",
+    )
+    p6.add_argument("--samples", type=int, default=1,
+                    help="Samples per query×mode (default 1; raise for CIs)")
+    p6.add_argument("--budget", type=float, default=10.0,
+                    help="Hard cap on USD spend (default $10)")
+    p6.add_argument("--log", type=Path, default=Path("runs/corpus.jsonl"))
+    p6.add_argument("--backend", default="canned", choices=["canned", "live"])
+    p6.add_argument("--modes", default="both",
+                    choices=["templated", "freeform", "both"])
+    p6.add_argument("--limit", type=int, default=None,
+                    help="Run only the first N corpus queries (debugging)")
+    p6.add_argument("--clarify", action="store_true",
+                    help="Run an LLM clarification-gate call before each "
+                         "cycle and record its cost separately.")
+    p6.set_defaults(func=cmd_run_corpus)
 
     p5 = sub.add_parser("serve", help="Run the web UI + map interface")
     p5.add_argument("--host", default="127.0.0.1",
@@ -290,6 +567,11 @@ def build_parser() -> argparse.ArgumentParser:
     p5.add_argument("--backend", default="canned", choices=["canned", "live"],
                     help="canned (default) for synthetic payloads; "
                          "live for OpenStreetMap + Planetary Computer.")
+    p5.add_argument("--measurement-log", type=Path, default=None,
+                    help="Local-use-only: write one JSONL line per LLM "
+                         "call to this path. Off by default because the "
+                         "JSONL pairs user_query with response_id; only "
+                         "enable on a single-user local server.")
     p5.set_defaults(func=cmd_serve)
 
     return p
@@ -300,6 +582,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
     os.environ["PGQA_BUDGET_USD"] = str(args.budget)
     os.environ["PGQA_BACKEND"] = args.backend
+    if args.measurement_log:
+        os.environ["PGQA_MEASUREMENT_LOG"] = str(args.measurement_log)
+        print(f"Measurement logging enabled → {args.measurement_log}")
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         print("WARNING: OPENAI_API_KEY not set — /api/ask will 500 until you "

@@ -292,8 +292,13 @@ main {
   outline-offset: -1px;
   border-color: #4a7bd1;
 }
-#ask {
+.composer-actions {
   align-self: flex-end;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+#ask {
   background: #1d2839;
   color: #fff;
   border: none;
@@ -307,6 +312,21 @@ main {
 }
 #ask:disabled { opacity: 0.5; cursor: progress; }
 #ask:hover:not(:disabled) { background: #2c3a55; }
+#reset {
+  background: #fff;
+  color: #6a7588;
+  border: 1px solid #c5cfdc;
+  padding: 4px 12px;
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 500;
+  border-radius: 6px;
+  cursor: pointer;
+  min-width: 80px;
+  letter-spacing: 0.04em;
+}
+#reset:hover { background: #f0f3f9; color: #1d2839; }
+#reset:active { background: #e2e7ef; }
 
 /* -----------------------------------------------------------------
    Responsive

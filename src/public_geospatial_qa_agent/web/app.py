@@ -37,7 +37,8 @@ from openai import OpenAI
 from .. import __version__
 from ..archetypes import ALL_ARCHETYPES, archetype_by_id
 from ..backends import make_backend
-from ..runner import needs_clarification, run_cycle
+from ..instrumentation import JsonlLogger
+from ..runner import llm_clarification_check, needs_clarification, run_cycle
 from .budget import Budget
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -66,6 +67,7 @@ def create_app(
     budget_cap_usd: float | None = None,
     api_key: str | None = None,
     backend_name: str | None = None,
+    measurement_log_path: str | None = None,
 ) -> FastAPI:
     """Build the FastAPI app. Exposed as a factory so the Playwright
     tests can construct an app with a stubbed OpenAI client or zero
@@ -76,6 +78,17 @@ def create_app(
         api_key = os.environ.get("OPENAI_API_KEY")
     if backend_name is None:
         backend_name = os.environ.get("PGQA_BACKEND", "canned")
+    if measurement_log_path is None:
+        measurement_log_path = os.environ.get("PGQA_MEASUREMENT_LOG") or None
+    # Open-once logger so concurrent SSE workers append to the same
+    # file. JsonlLogger.write isn't fully thread-safe, but FastAPI's
+    # threadpool runs one request per cycle and per-line writes flush
+    # immediately, so interleaving on local single-user use is rare
+    # enough to live with. Not appropriate for multi-tenant.
+    measurement_logger: JsonlLogger | None = None
+    if measurement_log_path:
+        Path(measurement_log_path).parent.mkdir(parents=True, exist_ok=True)
+        measurement_logger = JsonlLogger(measurement_log_path).__enter__()
 
     app = FastAPI(
         title="public-geospatial-qa-agent",
@@ -152,26 +165,49 @@ def create_app(
                 detail="Query is empty after sanitization.",
             )
 
-        # Clarification mode: if the client opts in via clarify=true and
-        # the query is missing a date range or a place, return a
-        # follow-up question instead of running a cycle. Frees the
-        # budget reservation since no LLM call happened.
+        # Optional client-supplied cache namespace + session id hint.
+        # cache_namespace: rotated on UI reset so each "fresh session"
+        # starts cold. session_id_hint: lets a corpus driver tag the
+        # JSONL records with a stable id like "sdv-01-templated-s1".
+        cache_namespace = body.get("cache_namespace") or "default"
+        session_id_hint = body.get("session_id") or None
+        prompt_cache_key = f"public-geospatial-qa-agent-{cache_namespace}"
+
+        client = OpenAI(api_key=api_key)
+
+        # Clarification mode: if the client opts in via clarify=true,
+        # make one small LLM call that decides whether to ask back.
+        # The call's cost is logged + surfaced to the UI either way.
         if body.get("clarify"):
-            question = needs_clarification(query)
-            if question:
-                budget.settle(0.0)
+            result = llm_clarification_check(client, query)
+            budget.settle(result.cost_usd)
+            if result.question:
                 return StreamingResponse(
-                    _stream_clarification(question=question, query=query),
+                    _stream_clarification(
+                        question=result.question, query=query,
+                        clarify_cost=result.cost_usd,
+                        clarify_tokens=result.prompt_tokens + result.completion_tokens,
+                    ),
                     media_type="text/event-stream",
+                )
+            # The cycle path needs a fresh reserve since we just
+            # settled. Re-reserve and continue.
+            if not budget.reserve():
+                raise HTTPException(
+                    status_code=429,
+                    detail="Budget exhausted after clarification check.",
                 )
 
         return StreamingResponse(
             _stream_cycle(
-                client=OpenAI(api_key=api_key),
+                client=client,
                 archetype=archetype,
                 user_query=query,
                 budget=budget,
                 backend=make_backend(backend_name),
+                prompt_cache_key=prompt_cache_key,
+                session_id=session_id_hint,
+                logger=measurement_logger,
             ),
             media_type="text/event-stream",
         )
@@ -179,15 +215,31 @@ def create_app(
     return app
 
 
-def _stream_clarification(*, question: str, query: str):
+def _stream_clarification(
+    *, question: str, query: str,
+    clarify_cost: float = 0.0, clarify_tokens: int = 0,
+):
     """Single-frame SSE producer for the clarification path. Pushes one
-    'clarification' event and ends. No worker thread, no budget spend."""
+    'clarification' event and ends. Surfaces the LLM gate's cost +
+    token usage so the UI can show what the question cost."""
+    payload = {
+        "type": "clarification",
+        "question": question,
+        "pending_query": query,
+        "clarify_cost_usd": round(clarify_cost, 6),
+        "clarify_tokens": clarify_tokens,
+    }
     def gen():
-        yield f"data: {json.dumps({'type': 'clarification', 'question': question, 'pending_query': query})}\n\n"
+        yield f"data: {json.dumps(payload)}\n\n"
     return gen()
 
 
-def _stream_cycle(*, client, archetype, user_query, budget, backend):
+def _stream_cycle(
+    *, client, archetype, user_query, budget, backend,
+    prompt_cache_key: str = "public-geospatial-qa-agent",
+    session_id: str | None = None,
+    logger: JsonlLogger | None = None,
+):
     """SSE producer. Runs `run_cycle` in a worker thread so the SSE
     handler can drain a queue and push events as they happen.
 
@@ -226,6 +278,9 @@ def _stream_cycle(*, client, archetype, user_query, budget, backend):
                 mode="templated",  # public endpoint is templated-only
                 user_query=user_query,
                 backend=backend,
+                prompt_cache_key=prompt_cache_key,
+                session_id=session_id,
+                logger=logger,
                 on_stage=on_stage,
             )
             budget.settle(trace.total_cost_usd)

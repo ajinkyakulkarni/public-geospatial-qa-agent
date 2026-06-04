@@ -38,6 +38,21 @@
   let turnCount = 0;
   let inFlight = false;
   let pendingClarification = null; // {originalQuery, question} when agent asked back
+  // Per-session cache namespace. The server uses this as the
+  // prompt_cache_key suffix so each Reset starts the next cycle on a
+  // cold cache. Rotated on Reset; persists across turns inside a
+  // session so cache warm-up across turns is real.
+  let sessionKey = newSessionKey();
+
+  function newSessionKey() {
+    // 8 hex chars from crypto if available, otherwise Math.random.
+    if (window.crypto && crypto.getRandomValues) {
+      const a = new Uint8Array(4);
+      crypto.getRandomValues(a);
+      return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+    }
+    return Math.random().toString(16).slice(2, 10);
+  }
 
   const $ = (id) => document.getElementById(id);
   const el = (tag, attrs = {}, children = []) => {
@@ -309,13 +324,19 @@
     scrollChatToBottom();
   }
 
-  function renderClarification(parts, question) {
+  function renderClarification(parts, question, costUsd, tokens) {
     parts.headline.textContent = question;
     parts.headline.classList.add("clarification");
-    // Hide the empty stage list and summary block — we never ran the
-    // cycle in this turn, so showing zeroed-out stages would mislead.
     parts.stages.style.display = "none";
-    parts.summary.style.display = "none";
+    if (typeof costUsd === "number" && costUsd > 0) {
+      parts.summary.style.display = "";
+      parts.summary.innerHTML = `
+        <div><b>clarify</b> ${tokens || 0} tok</div>
+        <div><b>cost</b> $${costUsd.toFixed(6)}</div>
+      `;
+    } else {
+      parts.summary.style.display = "none";
+    }
     scrollChatToBottom();
   }
 
@@ -367,10 +388,20 @@
     const parts = appendAgentBubble(turnIdx);
 
     try {
+      // Measurement runs (the Playwright corpus driver) set
+      // window.PGQA_SESSION_ID before clicking Send so the server's
+      // JSONL log records a stable id tied to the corpus query.
+      const sessionIdHint = window.PGQA_SESSION_ID || undefined;
+      const body = {
+        query: effectiveQuery,
+        clarify: clarifyEnabled,
+        cache_namespace: sessionKey,
+      };
+      if (sessionIdHint) body.session_id = sessionIdHint;
       const r = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: effectiveQuery, clarify: clarifyEnabled }),
+        body: JSON.stringify(body),
       });
       if (!r.ok) {
         const errBody = await r.json().catch(() => ({ detail: r.statusText }));
@@ -407,7 +438,10 @@
           } else if (evt.type === "done") {
             renderTurnSummary(parts, evt.trace);
           } else if (evt.type === "clarification") {
-            renderClarification(parts, evt.question);
+            renderClarification(
+              parts, evt.question,
+              evt.clarify_cost_usd, evt.clarify_tokens
+            );
             pendingClarification = {
               originalQuery: evt.pending_query,
               question: evt.question,
@@ -428,6 +462,31 @@
   }
 
   /* -------------------------------------------------------------- */
+  /* Reset                                                          */
+  /* -------------------------------------------------------------- */
+  function resetSession() {
+    if (inFlight) return;
+    // Drop every chat message except the original welcome bubble.
+    const chat = $("chat");
+    const welcome = chat.firstElementChild;
+    chat.innerHTML = "";
+    if (welcome) chat.appendChild(welcome);
+    // Clear all map overlays.
+    geoLayers.forEach((l) => l && map.removeLayer(l));
+    itemsLayers.forEach((g) => g && map.removeLayer(g));
+    geoLayers = [];
+    itemsLayers = [];
+    geocodeBboxByTurn = [];
+    $("map-legend").innerHTML = "";
+    // Reset conversation state.
+    turnCount = 0;
+    pendingClarification = null;
+    sessionKey = newSessionKey();
+    map.setView([20, 0], 2);
+    $("query").focus();
+  }
+
+  /* -------------------------------------------------------------- */
   /* Boot                                                           */
   /* -------------------------------------------------------------- */
   window.addEventListener("DOMContentLoaded", () => {
@@ -435,6 +494,7 @@
     loadHealth();
     loadArchetypes();
     $("composer").addEventListener("submit", askQuestion);
+    $("reset").addEventListener("click", resetSession);
     $("query").addEventListener("keydown", (e) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "Enter") askQuestion(e);
     });
