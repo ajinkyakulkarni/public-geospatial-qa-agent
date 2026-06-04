@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Public Geospatial Q&amp;A Agent</title>
+  <!-- Leaflet from unpkg — no build step, no node_modules -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+        crossorigin="" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+          crossorigin=""></script>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header>
+    <h1>Public Geospatial Q&amp;A Agent</h1>
+    <div id="health" class="health">checking…</div>
+  </header>
+
+  <main>
+    <section id="map-pane">
+      <div id="map"></div>
+    </section>
+
+    <section id="control-pane">
+      <div id="ask-row">
+        <textarea
+          id="query"
+          rows="3"
+          maxlength="1024"
+          placeholder="Ask a question — e.g. Show NO2 air quality data for Los Angeles County from January to June 2020."
+        ></textarea>
+        <div id="archetypes" class="archetypes" aria-label="Example queries"></div>
+        <button id="ask" type="button">Ask</button>
+      </div>
+
+      <div id="trace">
+        <h2>Agent trace</h2>
+        <div id="stages"></div>
+        <div id="summary" class="summary" hidden></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

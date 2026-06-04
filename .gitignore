@@ -1,0 +1,23 @@
+# Python build
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+build/
+dist/
+
+# Measurement output
+runs/
+
+# Local config
+.env
+*.env.local
+
+# Pytest cache
+.pytest_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

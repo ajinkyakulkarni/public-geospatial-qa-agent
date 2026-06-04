@@ -1,0 +1,36 @@
+[project]
+name = "public-geospatial-qa-agent"
+version = "0.1.0"
+description = "Six-stage geospatial Q&A agent, instrumented for OpenAI prompt-cache measurement."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  # openai>=1.40 is when the prompt_cache_key extra_body field
+  # stabilised. Older versions silently ignore it, which would
+  # invalidate every cache-rate measurement we report.
+  "openai>=1.40,<2",
+  "tiktoken>=0.7",
+  # Web UI mode dependencies. Kept as required (not optional) because
+  # the CLI's `serve` subcommand needs them at import time and most
+  # users will want to run the UI.
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  # Reads .env file at CLI startup so OPENAI_API_KEY doesn't have to be
+  # exported every shell. Small, well-known, no transitive deps.
+  "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+]
+
+[project.scripts]
+public-geospatial-qa-agent = "public_geospatial_qa_agent.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

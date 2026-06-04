@@ -1,0 +1,67 @@
+{
+  "AGENT_RESPONSES": {
+    "out_of_scope_topic": "That question isn't something I can help with. I work with Earth observation data only — atmosphere, ocean, cryosphere, surface, and biosphere measurements. Try rephrasing around a measurable phenomenon (for example: air quality, methane, sea surface temperature, vegetation, precipitation) plus a location and time window.",
+    "out_of_scope_policy": "I can show measured values from the catalog, but I can't make policy recommendations, predictions, or causal interpretations. If a data-derived chart or summary would help, I can produce one for a specific phenomenon, area, and time window.",
+    "greeting": "I help you explore Earth observation data. Try asking about a specific phenomenon, location, and time window — for instance: 'Show NO2 levels over Los Angeles for January through June 2020'.",
+    "topic_required": "What kind of Earth observation data are you interested in? Common topics include air quality, methane emissions, sea surface temperature, vegetation, and precipitation.",
+    "datetime_required": "I need a time window before I can pull data. A range like 'summer 2022' or '2023-01-01 to 2023-12-31' works.",
+    "place_required": "I need a location before I can pull data. A place name like 'Los Angeles', 'California', or 'Amazon basin' works.",
+    "datetime_and_place_required": "I need both a location and a time window. Try something like 'Houston, TX, January 2023' and I can take it from there.",
+    "rate_limit": "The catalog service is rate-limiting requests right now. Try again in a moment.",
+    "api_unavailable": "The {service_name} service is unavailable at the moment. Try again shortly.",
+    "timeout": "That request timed out. A smaller area or shorter time window should respond faster."
+  },
+  "DATETIME_RESPONSES": {
+    "success": "Time window set to {datetime}. Confirm to continue.",
+    "error_invalid": "Couldn't parse '{error}' as a date. Use an ISO-8601 form such as '2023-01-01/2023-12-31'.",
+    "error_future": "The end date {end_date} is in the future. Use a window ending today or earlier.",
+    "error_range": "Start date must come before end date — please reverse them."
+  },
+  "PLACE_RESPONSES": {
+    "success": "Location set to '{place}'. The map shows the resolved area; confirm to continue.",
+    "error_not_found": "No location matched '{query}'. A more specific name (city, county, state) usually helps.",
+    "error_ambiguous": "More than one place matched '{query}'. Did you mean: {options}?",
+    "error_geocoding": "The geocoder reported: {error}"
+  },
+  "COLLECTIONS_RESPONSES": {
+    "success_single": "One matching dataset: {title}.",
+    "success_multiple": "{count} candidate datasets matched. Pick one to continue.",
+    "error_none": "No datasets matched that topic plus area plus time window. Widen one of those filters — a broader date range, a larger area, or a related topic — and I can try again.",
+    "error_none_spatial": "No datasets cover the location you chose. A different area or a broader topic may help.",
+    "error_none_temporal": "No datasets cover the time window you chose. A different range may help.",
+    "error_search": "The dataset search failed: {error}"
+  },
+  "SELECT_COLLECTION_RESPONSES": {
+    "success": "Selected '{title}'.",
+    "success_with_variable": "Selected '{title}' with variable '{variable}'.",
+    "success_need_datetime_and_place": "Selected '{title}'. To run the analysis I'll need a time window and a location.",
+    "success_need_datetime": "Selected '{title}'. To run the analysis I'll need a time window.",
+    "success_need_place": "Selected '{title}'. To run the analysis I'll need a location.",
+    "pending_variable": "'{title}' publishes multiple variables. Pick the one you want.",
+    "error_invalid_collection": "'{collection_id}' isn't one of the matched options. Pick from the listed candidates.",
+    "error_invalid_variable": "'{variable}' isn't a variable in this dataset.",
+    "error_not_in_catalog": "'{collection_id}' isn't in the catalog. Run a search first to see what's available."
+  },
+  "STAC_RESPONSES": {
+    "success": "Found {retrieved} catalog item{plural}.",
+    "success_limited": "Found {retrieved} of {matched} matching item{plural} (the rest were beyond the per-search limit).",
+    "error_none": "No items fall inside that area and time window. A broader area or wider window may help.",
+    "error_no_bbox": "I don't have a bounding box yet — confirm a location first.",
+    "error_no_datetime": "I don't have a time window yet — confirm a date range first.",
+    "error_search": "The catalog search failed: {error}"
+  },
+  "STATS_RESPONSES": {
+    "success": "Computed statistics over {count} item{plural}.",
+    "error_none": "No statistics could be computed.",
+    "error_no_geometry": "I don't have an area to compute statistics over — confirm a location first.",
+    "error_no_items": "There are no items to summarize. Either no data was found, or the topic and area don't intersect for the chosen window.",
+    "error_partial": "Computed statistics over {success_count} of {total_count} items; {failed_count} failed.",
+    "error_api": "The statistics service reported: {error}"
+  },
+  "VIZ_RESPONSES": {
+    "success": "Built map layers for {count} item{plural}.",
+    "error_none": "No layers could be built.",
+    "error_no_items": "Nothing to visualize — no items have been computed yet.",
+    "error_api": "The tiling service reported: {error}"
+  }
+}
