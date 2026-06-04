@@ -37,7 +37,7 @@ from openai import OpenAI
 from .. import __version__
 from ..archetypes import ALL_ARCHETYPES, archetype_by_id
 from ..backends import make_backend
-from ..runner import run_cycle
+from ..runner import needs_clarification, run_cycle
 from .budget import Budget
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -152,6 +152,19 @@ def create_app(
                 detail="Query is empty after sanitization.",
             )
 
+        # Clarification mode: if the client opts in via clarify=true and
+        # the query is missing a date range or a place, return a
+        # follow-up question instead of running a cycle. Frees the
+        # budget reservation since no LLM call happened.
+        if body.get("clarify"):
+            question = needs_clarification(query)
+            if question:
+                budget.settle(0.0)
+                return StreamingResponse(
+                    _stream_clarification(question=question, query=query),
+                    media_type="text/event-stream",
+                )
+
         return StreamingResponse(
             _stream_cycle(
                 client=OpenAI(api_key=api_key),
@@ -164,6 +177,14 @@ def create_app(
         )
 
     return app
+
+
+def _stream_clarification(*, question: str, query: str):
+    """Single-frame SSE producer for the clarification path. Pushes one
+    'clarification' event and ends. No worker thread, no budget spend."""
+    def gen():
+        yield f"data: {json.dumps({'type': 'clarification', 'question': question, 'pending_query': query})}\n\n"
+    return gen()
 
 
 def _stream_cycle(*, client, archetype, user_query, budget, backend):

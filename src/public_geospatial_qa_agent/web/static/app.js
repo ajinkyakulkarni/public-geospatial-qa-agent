@@ -34,8 +34,10 @@
   let map;
   let itemsLayers = [];   // per-turn L.FeatureGroup of STAC items
   let geoLayers = [];     // per-turn L.GeoJSON of geocoded areas
+  let geocodeBboxByTurn = []; // per-turn AOI bbox, used to clip items
   let turnCount = 0;
   let inFlight = false;
+  let pendingClarification = null; // {originalQuery, question} when agent asked back
 
   const $ = (id) => document.getElementById(id);
   const el = (tag, attrs = {}, children = []) => {
@@ -69,17 +71,18 @@
     if (!geocode || !geocode.geometry) return;
     const color = colorForTurn(turnIdx);
     const layer = L.geoJSON(geocode.geometry, {
-      style: { color, weight: 2, fillOpacity: 0.12 },
+      style: { color, weight: 2, fillOpacity: 0.06 },
     }).bindTooltip(`turn ${turnIdx + 1}: ${geocode.place || ""}`);
     layer.addTo(map);
     geoLayers[turnIdx] = layer;
     if (geocode.bbox && geocode.bbox.length === 4) {
+      geocodeBboxByTurn[turnIdx] = geocode.bbox;
       const [w, s, e, n] = geocode.bbox;
       map.fitBounds([[s, w], [n, e]], { padding: [20, 20] });
     }
   }
 
-  function renderStacItemsForTurn(turnIdx, items) {
+  function renderStacItemsForTurn(turnIdx, items, aoiBbox) {
     if (!items || items.length === 0) return;
     const color = colorForTurn(turnIdx);
     let group = itemsLayers[turnIdx];
@@ -87,14 +90,38 @@
       group = L.featureGroup().addTo(map);
       itemsLayers[turnIdx] = group;
     }
-    items.forEach((it) => {
-      if (!it.bbox || it.bbox.length !== 4) return;
+    // Some STAC collections (e.g. Sentinel-5P) carry hemispheric per-
+    // item bboxes; drawing all of them at any fill opacity paints
+    // the whole map. Skip items whose bbox is much larger than the
+    // AOI, and cap the rest to the first few with outline-only.
+    const aoiArea = aoiBbox ? bboxArea(aoiBbox) : null;
+    let drawn = 0;
+    for (const it of items) {
+      if (!it.bbox || it.bbox.length !== 4) continue;
+      if (aoiArea && bboxArea(it.bbox) > aoiArea * 20) continue;
       const [w, s, e, n] = it.bbox;
       const rect = L.rectangle([[s, w], [n, e]], {
-        color, weight: 1, fillOpacity: 0.05,
+        color, weight: 1, fill: false, opacity: 0.8,
       }).bindTooltip(`${it.id}<br/>${it.datetime || ""}`);
       group.addLayer(rect);
-    });
+      if (++drawn >= 5) break;
+    }
+    // If nothing fit (everything was too large), drop a centroid dot
+    // at the AOI so the user sees the turn registered on the map.
+    if (drawn === 0 && aoiBbox) {
+      const [w, s, e, n] = aoiBbox;
+      const cx = (w + e) / 2;
+      const cy = (s + n) / 2;
+      const dot = L.circleMarker([cy, cx], {
+        radius: 6, color, weight: 2, fillOpacity: 0.4,
+      }).bindTooltip(`${items.length} items in AOI`);
+      group.addLayer(dot);
+    }
+  }
+
+  function bboxArea(b) {
+    const [w, s, e, n] = b;
+    return Math.max(0, e - w) * Math.max(0, n - s);
   }
 
   function appendLegendRow(turnIdx, label) {
@@ -214,6 +241,59 @@
     return "";
   }
 
+  function renderStatsTable(parts, perItem) {
+    if (!perItem || perItem.length === 0) return;
+    if (parts.bubble.querySelector(".stats-table")) return; // idempotent
+    // Pick the columns from the first row. Excludes item_id (long, noisy).
+    const sample = perItem[0];
+    const keys = Object.keys(sample).filter(
+      (k) => k !== "item_id" && sample[k] !== null && sample[k] !== undefined
+    );
+    if (keys.length === 0) return;
+    const wrap = el("div", { class: "stats-table" });
+    wrap.appendChild(el("div", { class: "stats-caption",
+                                  text: `compute_stats — ${perItem.length} rows` }));
+    const table = el("table");
+    const thead = el("thead");
+    const headRow = el("tr");
+    headRow.appendChild(el("th", { text: "#" }));
+    keys.forEach((k) => headRow.appendChild(el("th", { text: k })));
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    const tbody = el("tbody");
+    perItem.slice(0, 5).forEach((row, i) => {
+      const tr = el("tr");
+      tr.appendChild(el("td", { text: String(i + 1) }));
+      keys.forEach((k) => {
+        const v = row[k];
+        tr.appendChild(el("td", {
+          text: typeof v === "number" ? formatNumber(v) : (v == null ? "—" : String(v)),
+        }));
+      });
+      tbody.appendChild(tr);
+    });
+    if (perItem.length > 5) {
+      const tr = el("tr", { class: "stats-more" });
+      const td = el("td", { text: `+ ${perItem.length - 5} more` });
+      td.colSpan = keys.length + 1;
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    parts.bubble.appendChild(wrap);
+    scrollChatToBottom();
+  }
+
+  function formatNumber(n) {
+    if (!Number.isFinite(n)) return String(n);
+    const abs = Math.abs(n);
+    if (abs >= 1000) return n.toFixed(0);
+    if (abs >= 1) return n.toFixed(2);
+    if (abs >= 0.001) return n.toFixed(4);
+    return n.toExponential(2);
+  }
+
   function renderTurnSummary(parts, trace) {
     parts.headline.textContent = "Done.";
     const ratio = (trace.cache_ratio * 100).toFixed(1);
@@ -226,6 +306,16 @@
       <div><b>server-side state</b> ${fmt(trace.final_state_size_chars)} chars</div>
       <div><b>kept from LLM</b> by templating</div>
     `;
+    scrollChatToBottom();
+  }
+
+  function renderClarification(parts, question) {
+    parts.headline.textContent = question;
+    parts.headline.classList.add("clarification");
+    // Hide the empty stage list and summary block — we never ran the
+    // cycle in this turn, so showing zeroed-out stages would mislead.
+    parts.stages.style.display = "none";
+    parts.summary.style.display = "none";
     scrollChatToBottom();
   }
 
@@ -260,9 +350,19 @@
 
     inFlight = true;
     $("ask").disabled = true;
+
+    // If the agent just asked a clarifying question, fold this answer
+    // into the original query and clear the pending state.
+    let effectiveQuery = text;
+    if (pendingClarification) {
+      effectiveQuery = `${pendingClarification.originalQuery} — ${text}`;
+      pendingClarification = null;
+    }
+
     appendUserBubble(text);
     $("query").value = "";
 
+    const clarifyEnabled = $("clarify").checked;
     const turnIdx = turnCount++;
     const parts = appendAgentBubble(turnIdx);
 
@@ -270,7 +370,7 @@
       const r = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: text }),
+        body: JSON.stringify({ query: effectiveQuery, clarify: clarifyEnabled }),
       });
       if (!r.ok) {
         const errBody = await r.json().catch(() => ({ detail: r.statusText }));
@@ -297,10 +397,21 @@
               appendLegendRow(turnIdx, p.geocode.place || "(area)");
             }
             if (p.stac_items) {
-              renderStacItemsForTurn(turnIdx, p.stac_items);
+              renderStacItemsForTurn(
+                turnIdx, p.stac_items, geocodeBboxByTurn[turnIdx]
+              );
+            }
+            if (p.stats) {
+              renderStatsTable(parts, p.stats);
             }
           } else if (evt.type === "done") {
             renderTurnSummary(parts, evt.trace);
+          } else if (evt.type === "clarification") {
+            renderClarification(parts, evt.question);
+            pendingClarification = {
+              originalQuery: evt.pending_query,
+              question: evt.question,
+            };
           } else if (evt.type === "error") {
             renderStageError(parts, evt.message);
           }

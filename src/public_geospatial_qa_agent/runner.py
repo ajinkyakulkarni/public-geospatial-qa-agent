@@ -338,3 +338,31 @@ def _derive_args_from_query(query: str) -> dict[str, str]:
     )
     place = place_match.group(1) if place_match else "Los Angeles County, California"
     return {"datetime": dt, "place": place}
+
+
+def needs_clarification(query: str) -> str | None:
+    """Return a follow-up question if the query is missing a date range
+    or a place; otherwise None.
+
+    The check is rule-based on purpose — it should be cheap, predictable,
+    and have an off switch. An LLM-based intent extractor would be more
+    forgiving but adds an extra billable call per turn before the cycle
+    even starts.
+    """
+    import re
+    has_year = bool(re.search(_YEAR_RX, query))
+    has_month = bool(re.search(_MONTH_RX, query))
+    has_date = has_year or has_month
+    has_place = bool(re.search(
+        r"(?:over|in|for|near|across)\s+(?:the\s+)?"
+        r"[A-Z][\w]+(?:\s+[A-Z][\w]+){0,3}",
+        query,
+    ))
+    if not has_date and not has_place:
+        return ("What place and date range should I look at? "
+                "For example: \"NO2 over Houston for 2021\".")
+    if not has_date:
+        return "What date range or year do you want?"
+    if not has_place:
+        return "What place should I search? A city, county, or region works."
+    return None

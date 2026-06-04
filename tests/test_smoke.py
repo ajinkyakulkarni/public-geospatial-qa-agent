@@ -180,6 +180,22 @@ def test_response_templates_load():
 # Backend protocol — canned implementation
 # ---------------------------------------------------------------------
 
+def test_clarification_rules():
+    from public_geospatial_qa_agent.runner import needs_clarification
+    # Both missing
+    q = needs_clarification("show me what you have")
+    assert q is not None and "place" in q.lower()
+    # Place missing
+    q = needs_clarification("I want data for 2021")
+    assert q is not None and "place" in q.lower()
+    # Date missing
+    q = needs_clarification("Compare NO2 over Houston metro")
+    assert q is not None and ("date" in q.lower() or "year" in q.lower())
+    # Both present
+    assert needs_clarification("NO2 over Houston for 2021") is None
+    assert needs_clarification("NO2 in Los Angeles between Jan 2020 and June 2020") is None
+
+
 def test_canned_backend_returns_expected_shapes():
     """The CannedBackend round-trips every method without raising and
     returns the keys downstream code reads."""
