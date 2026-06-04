@@ -24,6 +24,11 @@ dependencies = [
 dev = [
   "pytest>=7.0",
 ]
+# Live backend pulls in pystac-client for Planetary Computer STAC
+# queries. Geocoding uses stdlib urllib so it's not gated.
+live = [
+  "pystac-client>=0.7",
+]
 
 [project.scripts]
 public-geospatial-qa-agent = "public_geospatial_qa_agent.cli:main"

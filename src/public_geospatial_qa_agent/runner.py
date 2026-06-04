@@ -22,6 +22,7 @@ from typing import Any, Callable
 from openai import OpenAI
 
 from .archetypes import Archetype
+from .backends import Backend, CannedBackend
 from .cost import GPT_5_2_STANDARD, RateCard, cost_for_call
 from .instrumentation import CallRecord, JsonlLogger, iso_now
 from .state import AgentState
@@ -98,6 +99,7 @@ def run_cycle(
     logger: JsonlLogger | None = None,
     session_id: str | None = None,
     user_query: str | None = None,
+    backend: Backend | None = None,
     on_stage: Callable[["Stage", "AgentState"], None] | None = None,
 ) -> CycleTrace:
     """Run one full cycle (6 stages) for one archetype in one mode.
@@ -134,9 +136,11 @@ def run_cycle(
         tools = load_tool_schemas()
     if session_id is None:
         session_id = str(uuid.uuid4())
+    if backend is None:
+        backend = CannedBackend()
 
     state = AgentState()
-    tool_wrappers = make_tools(mode, state)
+    tool_wrappers = make_tools(mode, state, backend)
     effective_query = user_query if user_query is not None else archetype.query
 
     messages: list[dict[str, Any]] = [
@@ -151,6 +155,8 @@ def run_cycle(
         mode=mode,
     )
     tool_chars_running = 0
+
+    derived = _derive_args_from_query(effective_query)
 
     for stage_idx, stage_name in enumerate(archetype.pipeline, start=1):
         # ── Call OpenAI ────────────────────────────────────────────
@@ -187,7 +193,7 @@ def run_cycle(
         # samples if the sequence is identical; the cached_tokens
         # numbers are what we're measuring, not the model's routing.
         tool_method = getattr(tool_wrappers, stage_name)
-        tool_args = _default_args_for_stage(stage_name, archetype)
+        tool_args = _default_args_for_stage(stage_name, archetype, state, derived)
         tool_message_content = tool_method(**tool_args)
 
         # Append the assistant's tool_call + the tool response so the
@@ -275,23 +281,60 @@ def run_cycle(
     return trace
 
 
-def _default_args_for_stage(stage_name: str, archetype: Archetype) -> dict[str, Any]:
-    """Return reasonable default arguments for each stage's tool.
+def _default_args_for_stage(
+    stage_name: str,
+    archetype: Archetype,
+    state: "AgentState",
+    derived: dict[str, str],
+) -> dict[str, Any]:
+    """Choose tool arguments for a stage.
 
-    The actual values plumb through to the tool wrapper, where they
-    populate state but only affect the LLM-visible message size via
-    the templated/freeform mode. Realistic representative inputs are
-    fine here — the cached_tokens telemetry is what we care about,
-    not the data accuracy."""
-    # Derive a default datetime + place from the archetype's query.
-    # Crude but reproducible; the tool wrappers don't actually parse
-    # the date/place strings.
+    For canned-backend measurement runs the args don't have to be
+    accurate — the wrappers don't parse them — but with the live
+    backend they have to be plausible. select_collection has to pick
+    something the rag stage actually returned, and stac_search has to
+    use that same collection_id so the catalog query lines up.
+    """
+    if stage_name == "select_collection" and state.collections_result:
+        matches = state.collections_result.get("matches", [])
+        if matches:
+            cid = matches[0]["id"]
+            return {"collection_id": cid}
+    if stage_name == "stac_search" and state.selected_collection_id:
+        return {"collection_id": state.selected_collection_id, "limit": 15}
     return {
-        "parse_datetime":   {"value": "2020-01-01/2020-06-30"},
-        "geocode":          {"query": "Los Angeles County, California"},
+        "parse_datetime":   {"value": derived["datetime"]},
+        "geocode":          {"query": derived["place"]},
         "collections_rag":  {"query": archetype.query, "top_k": 5},
         "select_collection": {"collection_id": "no2-monthly"},
         "stac_search":      {"collection_id": "no2-monthly", "limit": 15},
         "stats":            {},
         "viz":              {},
     }[stage_name]
+
+
+# Very small heuristic extractor. Picks a date range and a place name
+# out of the user's query string. Good enough to make the live backend
+# resolve a plausible bbox; not a substitute for an actual extractor
+# stage.
+_MONTH_RX = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*"
+_YEAR_RX = r"(?:19|20)\d{2}"
+
+
+def _derive_args_from_query(query: str) -> dict[str, str]:
+    import re
+    years = re.findall(_YEAR_RX, query)
+    if len(years) >= 2:
+        dt = f"{years[0]}-01-01/{years[1]}-12-31"
+    elif years:
+        dt = f"{years[0]}-01-01/{years[0]}-12-31"
+    else:
+        dt = "2020-01-01/2020-12-31"
+
+    place_match = re.search(
+        r"(?:over|in|for|near|across)\s+(?:the\s+)?"
+        r"([A-Z][\w]+(?:\s+[A-Z][\w]+){0,3})",
+        query,
+    )
+    place = place_match.group(1) if place_match else "Los Angeles County, California"
+    return {"datetime": dt, "place": place}

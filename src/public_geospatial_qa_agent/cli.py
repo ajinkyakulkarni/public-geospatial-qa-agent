@@ -42,6 +42,7 @@ from openai import OpenAI
 
 from . import __version__
 from .archetypes import ALL_ARCHETYPES, archetype_by_id
+from .backends import make_backend
 from .cost import GPT_5_2_STANDARD, monthly_extrapolation
 from .instrumentation import JsonlLogger
 from .runner import load_sysprompt, load_tool_schemas, run_cycle
@@ -108,10 +109,11 @@ def cmd_run_once(args: argparse.Namespace) -> int:
         return 2
     archetype = archetype_by_id(args.archetype)
     client = OpenAI(api_key=api_key)
-    print(f"Running cycle: archetype={archetype.id} mode={args.mode}")
+    backend = make_backend(args.backend)
+    print(f"Running cycle: archetype={archetype.id} mode={args.mode} backend={args.backend}")
     print(f"User query:    {archetype.query}")
     print()
-    trace = run_cycle(client, archetype, args.mode)
+    trace = run_cycle(client, archetype, args.mode, backend=backend)
 
     print(f"{'Stage':<26} {'prompt':>7} {'cached':>7} {'compl':>6}"
           f" {'cache%':>7} {'cost':>9}")
@@ -145,6 +147,7 @@ def cmd_run_suite(args: argparse.Namespace) -> int:
         print("ERROR: OPENAI_API_KEY not set in environment.", file=sys.stderr)
         return 2
     client = OpenAI(api_key=api_key)
+    backend = make_backend(args.backend)
     log_path = Path(args.log)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.unlink(missing_ok=True)
@@ -170,6 +173,7 @@ def cmd_run_suite(args: argparse.Namespace) -> int:
                         client, archetype, mode,
                         session_id=f"{archetype.id}-{mode}-s{sample_idx + 1}",
                         logger=logger,
+                        backend=backend,
                     )
                     spend += trace.total_cost_usd
                     if spend > args.budget:
@@ -259,6 +263,9 @@ def build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--archetype", default="single_dataset_viz",
                     choices=[a.id for a in ALL_ARCHETYPES])
     p2.add_argument("--mode", default="templated", choices=["templated", "freeform"])
+    p2.add_argument("--backend", default="canned", choices=["canned", "live"],
+                    help="canned (default) for offline synthetic payloads; "
+                         "live for Nominatim + Planetary Computer.")
     p2.set_defaults(func=cmd_run_once)
 
     p3 = sub.add_parser("run-suite", help="Run 5 archetypes × N samples × 2 modes")
@@ -266,6 +273,8 @@ def build_parser() -> argparse.ArgumentParser:
     p3.add_argument("--budget", type=float, default=5.0,
                     help="Hard cap on USD spend (default $5)")
     p3.add_argument("--log", type=Path, default=Path("runs/measurement.jsonl"))
+    p3.add_argument("--backend", default="canned", choices=["canned", "live"],
+                    help="Use canned for reproducible measurements.")
     p3.set_defaults(func=cmd_run_suite)
 
     p4 = sub.add_parser("analyze", help="Aggregate a JSONL log; no API calls")
@@ -278,6 +287,9 @@ def build_parser() -> argparse.ArgumentParser:
     p5.add_argument("--port", type=int, default=8000)
     p5.add_argument("--budget", type=float, default=1.0,
                     help="Process-wide USD budget cap. Default $1.00.")
+    p5.add_argument("--backend", default="canned", choices=["canned", "live"],
+                    help="canned (default) for synthetic payloads; "
+                         "live for OpenStreetMap + Planetary Computer.")
     p5.set_defaults(func=cmd_serve)
 
     return p
@@ -287,12 +299,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
     """Start the FastAPI web UI server."""
     import uvicorn
     os.environ["PGQA_BUDGET_USD"] = str(args.budget)
+    os.environ["PGQA_BACKEND"] = args.backend
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         print("WARNING: OPENAI_API_KEY not set — /api/ask will 500 until you "
               "set it.", file=sys.stderr)
     print(f"Starting server on http://{args.host}:{args.port}  "
-          f"(budget cap ${args.budget:.2f}). Ctrl+C to stop.")
+          f"(budget cap ${args.budget:.2f}, backend={args.backend}). "
+          f"Ctrl+C to stop.")
     uvicorn.run(
         "public_geospatial_qa_agent.web.app:app",
         host=args.host, port=args.port, reload=False,

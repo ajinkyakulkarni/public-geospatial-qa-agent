@@ -174,3 +174,46 @@ def test_response_templates_load():
     assert "STAC_RESPONSES" in t
     assert "STATS_RESPONSES" in t
     assert "VIZ_RESPONSES" in t
+
+
+# ---------------------------------------------------------------------
+# Backend protocol — canned implementation
+# ---------------------------------------------------------------------
+
+def test_canned_backend_returns_expected_shapes():
+    """The CannedBackend round-trips every method without raising and
+    returns the keys downstream code reads."""
+    from public_geospatial_qa_agent.backends import CannedBackend
+    b = CannedBackend()
+
+    g = b.geocode("Los Angeles County")
+    assert {"place", "bbox", "geometry"} <= g.keys()
+    assert len(g["bbox"]) == 4
+
+    r = b.collections_rag("NO2 air quality", top_k=3)
+    assert isinstance(r["matches"], list) and len(r["matches"]) == 3
+
+    s = b.stac_search("no2-monthly", g["bbox"], "2020-01-01/2020-06-30", 15)
+    assert len(s["items"]) == 15
+    assert s["matched"] == 15
+
+    stats = b.stats(s["items"], g["bbox"])
+    assert stats["count"] == 15
+    assert all("mean" in row for row in stats["per_item"])
+
+    v = b.viz(s["items"], "no2-monthly")
+    assert v["count"] == 15
+
+
+@pytest.mark.skipif(not HAVE_DATA, reason="data/response_templates.json missing")
+def test_make_tools_accepts_custom_backend():
+    """make_tools should pass a custom backend through to TemplatedTools."""
+    from public_geospatial_qa_agent.backends import CannedBackend
+    state = AgentState()
+    backend = CannedBackend(seed=99)
+    tools = make_tools("templated", state, backend)
+    msg = tools.geocode("Houston, TX")
+    parsed = json.loads(msg)
+    assert parsed["status"] == "pending_confirmation"
+    # State got the full payload regardless of mode.
+    assert state.place_result["place"] == "Houston, TX"

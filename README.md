@@ -21,20 +21,29 @@ the full statistics dictionaries all go into the model's context. Same
 archetype, same backend, same `prompt_cache_key`; the difference in
 `cached_tokens` is what the two modes are there to surface.
 
+There are also two backends. `canned` (the default) returns deterministic
+synthetic payloads sized to match a calibrated cost preset — repeatable,
+no network, no rate-limit risk. `live` calls OpenStreetMap Nominatim and
+the Microsoft Planetary Computer STAC so the agent actually does what it
+says: type "Houston" and the real Houston bbox lands on the map, ask for
+sea surface temperature near the Gulf Coast and a real STAC catalog gets
+searched. Templated/freeform contrast works in either backend.
+
 ## Setup
 
 ```bash
 cd public-geospatial-qa-agent
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e .              # canned backend, offline
+# Optional — install pystac-client for the live Planetary Computer backend:
+pip install -e '.[live]'
 
-cp .env.example .env  # then edit, dropping in your OPENAI_API_KEY
+cp .env.example .env          # then edit, dropping in your OPENAI_API_KEY
 ```
 
-Tool schemas live under `data/` and are checked in. The system prompt and
-response templates under `data/` are also checked in — they're written from
-scratch for this repository.
+Tool schemas, the system prompt, and response templates live under `data/`
+and are checked in.
 
 ## CLI
 
@@ -51,8 +60,13 @@ serve                 # FastAPI app + browser UI on http://127.0.0.1:8000
 `run-once` is the right place to start once the key is in place.
 
 ```bash
+# Canned (offline, deterministic — what the measurement runs use):
 python3 -m public_geospatial_qa_agent.cli run-once \
     --archetype single_dataset_viz --mode templated
+
+# Live (OpenStreetMap + Planetary Computer):
+python3 -m public_geospatial_qa_agent.cli run-once \
+    --archetype catalog_discovery --mode templated --backend live
 ```
 
 `run-suite` writes one JSON object per LLM call into `runs/measurement.jsonl`.
@@ -66,24 +80,28 @@ python3 -m public_geospatial_qa_agent.cli analyze --log runs/measurement.jsonl
 
 `--budget` is a hard cap. The suite stops as soon as cumulative spend
 crosses it. The web app uses a separate process-wide budget guard you can
-override per launch.
+override per launch. Run-suite defaults to the `canned` backend because
+reproducible measurements need deterministic tool payloads — flip to
+`--backend live` if you want to bench what the live STAC actually
+returns instead.
 
 ## Browser UI
 
 ```bash
-python3 -m public_geospatial_qa_agent.cli serve --budget 1.00
+python3 -m public_geospatial_qa_agent.cli serve --budget 1.00 --backend live
 ```
 
-Open `http://127.0.0.1:8000/`. Type a question into the textbox or click one
-of the five quick-buttons. Each stage streams in as the server completes it,
-the map redraws after geocode (polygon for the area) and again after
-`stac_search` (rectangles for each item's bounding box).
+Open `http://127.0.0.1:8000/`. The page is conversation-style: type a
+question, the user bubble appears, the agent bubble fills in stage by
+stage as the SSE stream arrives, and the map updates after the geocode
+and STAC search. Ask a follow-up; the next turn's overlays draw in a
+new colour so you can compare areas side by side on the map.
 
-The page shows running token counts and per-stage cost in a side panel, so
-the cache warm-up is visible: the first cycle pays cold-cache rates on
-stage 1, subsequent cycles within the same prompt-cache window hit warm
-rates from the first stage. Keep the page open across a few queries to
-watch the cache rate climb.
+Each turn shows running token counts, cache share, and per-cycle cost
+right below the agent's response. The cache warm-up is visible: the
+first turn pays cold-cache rates on stage 1; later turns within the
+same `prompt_cache_key` window hit warm rates from stage 1 onward. Keep
+asking and watch the cached-share climb.
 
 ## Why the pipeline is fixed
 
@@ -119,12 +137,16 @@ public-geospatial-qa-agent/
 │       ├── instrumentation.py       # one JSON object per LLM call
 │       ├── cost.py                  # gpt-5.2 rate card
 │       ├── cli.py                   # argparse entry point
+│       ├── backends/                # tool data source
+│       │   ├── protocol.py          # Backend Protocol
+│       │   ├── canned.py            # deterministic synthetic payloads
+│       │   └── live.py              # Nominatim + Planetary Computer
 │       └── web/
 │           ├── __init__.py
 │           ├── app.py               # FastAPI + SSE
 │           ├── budget.py            # thread-safe process budget
 │           └── static/
-│               ├── index.html
+│               ├── index.html       # conversation-style chat UI
 │               ├── app.css
 │               └── app.js
 └── tests/

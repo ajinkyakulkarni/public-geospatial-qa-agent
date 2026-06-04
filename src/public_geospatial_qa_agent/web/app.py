@@ -36,6 +36,7 @@ from openai import OpenAI
 
 from .. import __version__
 from ..archetypes import ALL_ARCHETYPES, archetype_by_id
+from ..backends import make_backend
 from ..runner import run_cycle
 from .budget import Budget
 
@@ -64,6 +65,7 @@ def create_app(
     *,
     budget_cap_usd: float | None = None,
     api_key: str | None = None,
+    backend_name: str | None = None,
 ) -> FastAPI:
     """Build the FastAPI app. Exposed as a factory so the Playwright
     tests can construct an app with a stubbed OpenAI client or zero
@@ -72,6 +74,8 @@ def create_app(
         budget_cap_usd = float(os.environ.get("PGQA_BUDGET_USD", DEFAULT_BUDGET_USD))
     if api_key is None:
         api_key = os.environ.get("OPENAI_API_KEY")
+    if backend_name is None:
+        backend_name = os.environ.get("PGQA_BACKEND", "canned")
 
     app = FastAPI(
         title="public-geospatial-qa-agent",
@@ -101,6 +105,7 @@ def create_app(
             "budget_remaining_usd": round(st.remaining_usd, 4),
             "budget_spent_usd": round(st.spent_usd, 4),
             "has_api_key": api_key is not None,
+            "backend": backend_name,
         }
 
     @app.get("/api/archetypes")
@@ -153,6 +158,7 @@ def create_app(
                 archetype=archetype,
                 user_query=query,
                 budget=budget,
+                backend=make_backend(backend_name),
             ),
             media_type="text/event-stream",
         )
@@ -160,7 +166,7 @@ def create_app(
     return app
 
 
-def _stream_cycle(*, client, archetype, user_query, budget):
+def _stream_cycle(*, client, archetype, user_query, budget, backend):
     """SSE producer. Runs `run_cycle` in a worker thread so the SSE
     handler can drain a queue and push events as they happen.
 
@@ -198,6 +204,7 @@ def _stream_cycle(*, client, archetype, user_query, budget):
                 archetype,
                 mode="templated",  # public endpoint is templated-only
                 user_query=user_query,
+                backend=backend,
                 on_stage=on_stage,
             )
             budget.settle(trace.total_cost_usd)

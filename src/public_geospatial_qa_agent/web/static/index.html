@@ -4,7 +4,6 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Public Geospatial Q&amp;A Agent</title>
-  <!-- Leaflet from unpkg — no build step, no node_modules -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
         integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
         crossorigin="" />
@@ -22,25 +21,35 @@
   <main>
     <section id="map-pane">
       <div id="map"></div>
+      <div id="map-overlay" class="map-overlay">
+        <div class="overlay-title">Conversation map</div>
+        <div id="map-legend" class="legend"></div>
+      </div>
     </section>
 
-    <section id="control-pane">
-      <div id="ask-row">
-        <textarea
-          id="query"
-          rows="3"
-          maxlength="1024"
-          placeholder="Ask a question — e.g. Show NO2 air quality data for Los Angeles County from January to June 2020."
-        ></textarea>
-        <div id="archetypes" class="archetypes" aria-label="Example queries"></div>
-        <button id="ask" type="button">Ask</button>
+    <section id="chat-pane">
+      <div id="chat" class="chat" role="log" aria-live="polite">
+        <div class="msg agent">
+          <div class="bubble">
+            <p>Ask about an earth-observation dataset over a place and a time window.
+               Each turn runs the six-stage agent — parse_datetime, geocode, collections_rag,
+               select_collection, stac_search, stats — and updates the map as it goes.</p>
+            <p>Try one:</p>
+            <div id="archetypes" class="archetypes"></div>
+          </div>
+        </div>
       </div>
 
-      <div id="trace">
-        <h2>Agent trace</h2>
-        <div id="stages"></div>
-        <div id="summary" class="summary" hidden></div>
-      </div>
+      <form id="composer" class="composer" autocomplete="off">
+        <textarea
+          id="query"
+          rows="2"
+          maxlength="1024"
+          placeholder="Ask a question — e.g. Show NO2 air quality over Houston for 2021."
+          aria-label="Question"
+        ></textarea>
+        <button id="ask" type="submit">Send</button>
+      </form>
     </section>
   </main>
 

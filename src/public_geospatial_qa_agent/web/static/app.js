@@ -1,194 +1,281 @@
-/* Public Geospatial Q&A Agent — single-page UI.
+/* Conversation-style UI for the public geospatial Q&A agent.
  *
- * Three responsibilities, kept in three small named functions so the
- * code is easy to skim during review:
+ * Each user turn is one cycle of the six-stage agent. The previous
+ * turns stay visible above; the map accumulates layers across turns
+ * so the conversation builds up a picture of the area being explored.
  *
- *   - setupMap()      builds the Leaflet map and tile layer
- *   - loadHealth()    polls /api/health, fills the header
- *   - askQuestion()   POSTs /api/ask and consumes the SSE stream,
- *                     rendering each stage as it arrives and updating
- *                     the map when geocode / stac_search payloads land
- *
- * No frameworks, no bundler. Read top-to-bottom.
+ * Sections, in order:
+ *   - state + DOM helpers
+ *   - map (Leaflet) and per-turn layer groups
+ *   - chat feed and per-turn rendering
+ *   - SSE consumer for /api/ask
+ *   - boot
  */
 
 (() => {
-  let map;
-  let geoLayer;     // L.GeoJSON of the geocode polygon
-  let itemsLayer;   // L.FeatureGroup of STAC item markers
-  let inFlight = false;
-  // Track the currently selected archetype id so /api/ask receives the
-  // right one when the user clicks a quick-button. Defaults to the
-  // single-dataset archetype; updated when the user clicks an option.
-  let selectedArchetypeId = "single_dataset_viz";
+  /* -------------------------------------------------------------- */
+  /* State                                                          */
+  /* -------------------------------------------------------------- */
+  const STAGE_LABELS = {
+    parse_datetime:   "parse date range",
+    geocode:          "geocode",
+    collections_rag:  "search collections",
+    select_collection: "select collection",
+    stac_search:      "STAC search",
+    stats:            "compute stats",
+    viz:              "build viz",
+  };
 
-  /* ---------------------------------------------------------------- */
-  /* Map                                                               */
-  /* ---------------------------------------------------------------- */
+  // Color palette for per-turn map overlays. The first user turn is
+  // blue, the next is teal, then orange, then magenta, then green —
+  // looping. Keeps adjacent turns visually distinct on the map.
+  const TURN_COLORS = ["#4a7bd1", "#1ca7a0", "#e07b39", "#b34cb3", "#3b9d3b"];
+
+  let map;
+  let itemsLayers = [];   // per-turn L.FeatureGroup of STAC items
+  let geoLayers = [];     // per-turn L.GeoJSON of geocoded areas
+  let turnCount = 0;
+  let inFlight = false;
+
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, attrs = {}, children = []) => {
+    const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === "class") e.className = v;
+      else if (k === "html") e.innerHTML = v;
+      else if (k === "text") e.textContent = v;
+      else e.setAttribute(k, v);
+    }
+    for (const c of children) e.appendChild(c);
+    return e;
+  };
+
+  /* -------------------------------------------------------------- */
+  /* Map                                                            */
+  /* -------------------------------------------------------------- */
   function setupMap() {
-    map = L.map("map", { zoomControl: true }).setView([34.0, -118.0], 3);
+    map = L.map("map", { zoomControl: true }).setView([20, 0], 2);
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 18,
       attribution: "© OpenStreetMap",
     }).addTo(map);
-    itemsLayer = L.featureGroup().addTo(map);
   }
 
-  function renderGeocodeOnMap(geocode) {
-    // Geocode payload: { place, bbox, geometry }
-    if (geoLayer) { map.removeLayer(geoLayer); geoLayer = null; }
+  function colorForTurn(idx) {
+    return TURN_COLORS[idx % TURN_COLORS.length];
+  }
+
+  function renderGeocodeForTurn(turnIdx, geocode) {
     if (!geocode || !geocode.geometry) return;
-    geoLayer = L.geoJSON(geocode.geometry, {
-      style: { color: "#4a7bd1", weight: 2, fillOpacity: 0.15 },
-    }).addTo(map);
+    const color = colorForTurn(turnIdx);
+    const layer = L.geoJSON(geocode.geometry, {
+      style: { color, weight: 2, fillOpacity: 0.12 },
+    }).bindTooltip(`turn ${turnIdx + 1}: ${geocode.place || ""}`);
+    layer.addTo(map);
+    geoLayers[turnIdx] = layer;
     if (geocode.bbox && geocode.bbox.length === 4) {
       const [w, s, e, n] = geocode.bbox;
       map.fitBounds([[s, w], [n, e]], { padding: [20, 20] });
     }
   }
 
-  function renderStacItemsOnMap(items) {
-    itemsLayer.clearLayers();
-    if (!items) return;
+  function renderStacItemsForTurn(turnIdx, items) {
+    if (!items || items.length === 0) return;
+    const color = colorForTurn(turnIdx);
+    let group = itemsLayers[turnIdx];
+    if (!group) {
+      group = L.featureGroup().addTo(map);
+      itemsLayers[turnIdx] = group;
+    }
     items.forEach((it) => {
       if (!it.bbox || it.bbox.length !== 4) return;
       const [w, s, e, n] = it.bbox;
       const rect = L.rectangle([[s, w], [n, e]], {
-        color: "#c0392b",
-        weight: 1,
-        fillOpacity: 0.08,
+        color, weight: 1, fillOpacity: 0.05,
       }).bindTooltip(`${it.id}<br/>${it.datetime || ""}`);
-      itemsLayer.addLayer(rect);
+      group.addLayer(rect);
     });
   }
 
-  /* ---------------------------------------------------------------- */
-  /* Health                                                            */
-  /* ---------------------------------------------------------------- */
+  function appendLegendRow(turnIdx, label) {
+    const host = $("map-legend");
+    const swatch = el("span", { class: "legend-swatch" });
+    swatch.style.background = colorForTurn(turnIdx);
+    swatch.style.opacity = "0.4";
+    const row = el("div", { class: "legend-row" }, [
+      swatch,
+      el("span", { text: `turn ${turnIdx + 1}: ${label}` }),
+    ]);
+    host.appendChild(row);
+  }
+
+  /* -------------------------------------------------------------- */
+  /* Health                                                         */
+  /* -------------------------------------------------------------- */
   async function loadHealth() {
     try {
       const r = await fetch("/api/health");
       const j = await r.json();
-      const el = document.getElementById("health");
+      const e = $("health");
       const left = j.budget_remaining_usd.toFixed(4);
       const cap = j.budget_cap_usd.toFixed(2);
       const keyPart = j.has_api_key ? "" : " · ⚠ no API key";
-      el.textContent = `v${j.version} · budget $${left} / $${cap} left${keyPart}`;
-      if (!j.has_api_key) el.style.color = "#ffb547";
+      const backendPart = j.backend ? ` · backend ${j.backend}` : "";
+      e.textContent = `v${j.version} · $${left}/$${cap} left${backendPart}${keyPart}`;
+      e.style.color = j.has_api_key ? "" : "#ffb547";
     } catch (e) {
-      document.getElementById("health").textContent = "health check failed";
+      $("health").textContent = "health check failed";
     }
   }
 
-  /* ---------------------------------------------------------------- */
-  /* Archetype quick-buttons                                           */
-  /* ---------------------------------------------------------------- */
+  /* -------------------------------------------------------------- */
+  /* Archetype suggestions                                          */
+  /* -------------------------------------------------------------- */
   async function loadArchetypes() {
     try {
       const r = await fetch("/api/archetypes");
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const j = await r.json();
-      const host = document.getElementById("archetypes");
-      j.archetypes.forEach((a) => {
-        const b = document.createElement("button");
-        b.type = "button";
+      const host = $("archetypes");
+      j.archetypes.slice(0, 5).forEach((a) => {
+        const b = el("button", { type: "button", title: a.query });
         b.textContent = a.id.replace(/_/g, " ");
-        b.title = a.query;
-        b.dataset.archetypeId = a.id;
-        b.dataset.query = a.query;
         b.addEventListener("click", () => {
-          document.getElementById("query").value = a.query;
-          selectedArchetypeId = a.id;
+          $("query").value = a.query;
+          $("query").focus();
         });
         host.appendChild(b);
       });
     } catch (e) {
-      // Quick-buttons are optional; the textbox still works without
-      // them. Don't throw — just log.
       console.warn("archetypes failed to load:", e);
     }
   }
 
-  /* ---------------------------------------------------------------- */
-  /* Ask                                                               */
-  /* ---------------------------------------------------------------- */
-  function appendStage(ev) {
-    const host = document.getElementById("stages");
-    const card = document.createElement("div");
-    card.className = "stage";
-    card.dataset.stageName = ev.name;
-
-    const ratioPct = (ev.cache_ratio * 100).toFixed(1);
-    card.innerHTML = `
-      <h3>stage ${ev.idx} · ${ev.name}</h3>
-      <div class="meta">
-        <span><b>prompt</b> ${ev.prompt_tokens.toLocaleString()}</span>
-        <span><b>cached</b> ${ev.cached_tokens.toLocaleString()} (${ratioPct}%)</span>
-        <span><b>output</b> ${ev.completion_tokens.toLocaleString()}</span>
-        <span><b>cost</b> $${ev.call_cost_usd.toFixed(6)}</span>
-        <span><b>to LLM</b> ${ev.tool_message_chars.toLocaleString()} chars</span>
-        <span><b>server-side</b> ${ev.state_size_chars.toLocaleString()} chars</span>
-      </div>
-      <pre></pre>
-    `;
-    card.querySelector("pre").textContent = ev.tool_response_preview || "(empty)";
-    host.appendChild(card);
-    host.scrollTop = host.scrollHeight;
-
-    // Update the map for stages that produce visible artefacts
-    if (ev.map_payload?.geocode) renderGeocodeOnMap(ev.map_payload.geocode);
-    if (ev.map_payload?.stac_items) renderStacItemsOnMap(ev.map_payload.stac_items);
+  /* -------------------------------------------------------------- */
+  /* Chat                                                           */
+  /* -------------------------------------------------------------- */
+  function appendUserBubble(text) {
+    const bubble = el("div", { class: "bubble" });
+    bubble.appendChild(el("p", { text }));
+    const wrap = el("div", { class: "msg user" }, [bubble]);
+    $("chat").appendChild(wrap);
+    scrollChatToBottom();
+    return wrap;
   }
 
-  function showSummary(trace) {
-    const el = document.getElementById("summary");
+  function appendAgentBubble(turnIdx) {
+    const bubble = el("div", { class: "bubble" });
+    bubble.appendChild(el("p", { class: "agent-headline",
+                                  text: "Walking the six stages…" }));
+    const stages = el("div", { class: "stages" });
+    bubble.appendChild(stages);
+    const summary = el("div", { class: "turn-summary", style: "display:none" });
+    bubble.appendChild(summary);
+    const wrap = el("div", { class: "msg agent" }, [bubble]);
+    wrap.dataset.turnIdx = String(turnIdx);
+    $("chat").appendChild(wrap);
+    scrollChatToBottom();
+    return { wrap, bubble, stages, summary,
+             headline: bubble.querySelector(".agent-headline") };
+  }
+
+  function renderStage(parts, ev) {
+    let row = parts.stages.querySelector(`[data-stage="${ev.name}"]`);
+    if (!row) {
+      row = el("div", { class: "stage-row done", "data-stage": ev.name });
+      row.appendChild(el("span", { class: "stage-icon", text: "✓" }));
+      row.appendChild(el("span", { class: "stage-name",
+                                    text: STAGE_LABELS[ev.name] || ev.name }));
+      row.appendChild(el("span", { class: "stage-detail", text: "" }));
+      row.appendChild(el("span", { class: "stage-cost", text: "" }));
+      parts.stages.appendChild(row);
+    }
+    const detail = stageDetail(ev);
+    row.children[2].textContent = detail;
+    const pct = (ev.cache_ratio * 100).toFixed(0);
+    row.children[3].textContent = `${pct}% cached · $${ev.call_cost_usd.toFixed(6)}`;
+    scrollChatToBottom();
+  }
+
+  function stageDetail(ev) {
+    const p = ev.map_payload || {};
+    if (ev.name === "parse_datetime") return "";
+    if (ev.name === "geocode" && p.geocode) return p.geocode.place || "";
+    if (ev.name === "collections_rag" && p.collections) {
+      return `${p.collections.length} match${p.collections.length === 1 ? "" : "es"}`;
+    }
+    if (ev.name === "select_collection") return "";
+    if (ev.name === "stac_search" && p.stac_items) {
+      return `${p.stac_items.length} item${p.stac_items.length === 1 ? "" : "s"}`;
+    }
+    if (ev.name === "stats" && p.stats) {
+      return `${p.stats.length} row${p.stats.length === 1 ? "" : "s"}`;
+    }
+    return "";
+  }
+
+  function renderTurnSummary(parts, trace) {
+    parts.headline.textContent = "Done.";
     const ratio = (trace.cache_ratio * 100).toFixed(1);
-    el.hidden = false;
-    el.innerHTML = `
-      <h3>Cycle complete</h3>
-      <table>
-        <tr><td>Total prompt tokens</td><td class="stat">${trace.total_prompt_tokens.toLocaleString()}</td></tr>
-        <tr><td>Total cached</td><td class="stat">${trace.total_cached_tokens.toLocaleString()} (${ratio}%)</td></tr>
-        <tr><td>Total output</td><td class="stat">${trace.total_completion_tokens.toLocaleString()}</td></tr>
-        <tr><td>Per-cycle cost</td><td class="stat">$${trace.total_cost_usd.toFixed(6)}</td></tr>
-        <tr><td>Server-side state size</td><td class="stat">${trace.final_state_size_chars.toLocaleString()} chars</td></tr>
-      </table>
+    parts.summary.style.display = "";
+    parts.summary.innerHTML = `
+      <div><b>prompt</b> ${fmt(trace.total_prompt_tokens)} tok</div>
+      <div><b>cached</b> ${fmt(trace.total_cached_tokens)} (${ratio}%)</div>
+      <div><b>output</b> ${fmt(trace.total_completion_tokens)} tok</div>
+      <div><b>cost</b> $${trace.total_cost_usd.toFixed(6)}</div>
+      <div><b>server-side state</b> ${fmt(trace.final_state_size_chars)} chars</div>
+      <div><b>kept from LLM</b> by templating</div>
     `;
+    scrollChatToBottom();
   }
 
-  function showError(msg) {
-    const host = document.getElementById("stages");
-    const card = document.createElement("div");
-    card.className = "stage error";
-    card.innerHTML = `<h3>error</h3><pre></pre>`;
-    card.querySelector("pre").textContent = msg;
-    host.appendChild(card);
+  function renderStageError(parts, msg) {
+    parts.headline.textContent = "Stopped on error.";
+    const row = el("div", { class: "stage-row error" });
+    row.appendChild(el("span", { class: "stage-icon", text: "✗" }));
+    row.appendChild(el("span", { class: "stage-name", text: "error" }));
+    row.appendChild(el("span", { class: "stage-detail", text: msg }));
+    row.appendChild(el("span", { text: "" }));
+    parts.stages.appendChild(row);
+    scrollChatToBottom();
   }
 
-  async function askQuestion() {
+  function scrollChatToBottom() {
+    const c = $("chat");
+    c.scrollTop = c.scrollHeight;
+  }
+
+  function fmt(n) {
+    return (n || 0).toLocaleString();
+  }
+
+  /* -------------------------------------------------------------- */
+  /* Ask                                                            */
+  /* -------------------------------------------------------------- */
+  async function askQuestion(ev) {
+    if (ev) ev.preventDefault();
     if (inFlight) return;
-    const query = document.getElementById("query").value.trim();
-    if (!query) return;
+    const text = $("query").value.trim();
+    if (!text) return;
 
     inFlight = true;
-    const askBtn = document.getElementById("ask");
-    askBtn.disabled = true;
-    document.getElementById("stages").innerHTML = "";
-    document.getElementById("summary").hidden = true;
-    if (geoLayer) { map.removeLayer(geoLayer); geoLayer = null; }
-    itemsLayer.clearLayers();
+    $("ask").disabled = true;
+    appendUserBubble(text);
+    $("query").value = "";
+
+    const turnIdx = turnCount++;
+    const parts = appendAgentBubble(turnIdx);
 
     try {
       const r = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, archetype_id: selectedArchetypeId }),
+        body: JSON.stringify({ query: text }),
       });
       if (!r.ok) {
-        const err = await r.json().catch(() => ({ detail: r.statusText }));
-        throw new Error(err.detail || `HTTP ${r.status}`);
+        const errBody = await r.json().catch(() => ({ detail: r.statusText }));
+        throw new Error(errBody.detail || `HTTP ${r.status}`);
       }
-      // Consume the SSE stream
       const reader = r.body.getReader();
       const dec = new TextDecoder();
       let buf = "";
@@ -201,32 +288,44 @@
           const raw = buf.slice(0, nl).trim();
           buf = buf.slice(nl + 2);
           if (!raw.startsWith("data:")) continue;
-          const json = raw.slice(5).trim();
-          const ev = JSON.parse(json);
-          if (ev.type === "stage") appendStage(ev);
-          else if (ev.type === "done") showSummary(ev.trace);
-          else if (ev.type === "error") showError(ev.message);
+          const evt = JSON.parse(raw.slice(5).trim());
+          if (evt.type === "stage") {
+            renderStage(parts, evt);
+            const p = evt.map_payload || {};
+            if (p.geocode) {
+              renderGeocodeForTurn(turnIdx, p.geocode);
+              appendLegendRow(turnIdx, p.geocode.place || "(area)");
+            }
+            if (p.stac_items) {
+              renderStacItemsForTurn(turnIdx, p.stac_items);
+            }
+          } else if (evt.type === "done") {
+            renderTurnSummary(parts, evt.trace);
+          } else if (evt.type === "error") {
+            renderStageError(parts, evt.message);
+          }
         }
       }
     } catch (e) {
-      showError(e.message || String(e));
+      renderStageError(parts, e.message || String(e));
     } finally {
       inFlight = false;
-      askBtn.disabled = false;
+      $("ask").disabled = false;
+      $("query").focus();
       loadHealth();
     }
   }
 
-  /* ---------------------------------------------------------------- */
-  /* Boot                                                              */
-  /* ---------------------------------------------------------------- */
+  /* -------------------------------------------------------------- */
+  /* Boot                                                           */
+  /* -------------------------------------------------------------- */
   window.addEventListener("DOMContentLoaded", () => {
     setupMap();
     loadHealth();
     loadArchetypes();
-    document.getElementById("ask").addEventListener("click", askQuestion);
-    document.getElementById("query").addEventListener("keydown", (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") askQuestion();
+    $("composer").addEventListener("submit", askQuestion);
+    $("query").addEventListener("keydown", (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") askQuestion(e);
     });
   });
 })();
