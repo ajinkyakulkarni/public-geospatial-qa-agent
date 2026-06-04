@@ -49,7 +49,7 @@ import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-QUERIES_PATH = REPO_ROOT / "data" / "queries.json"
+DEFAULT_QUERIES_PATH = REPO_ROOT / "data" / "queries.json"
 
 
 def main() -> int:
@@ -72,6 +72,11 @@ def main() -> int:
                         help="JSONL the server is writing to; we emit "
                              "a .meta.json sidecar next to it so "
                              "analyze --corpus can join the records.")
+    parser.add_argument("--corpus-file", type=Path,
+                        default=DEFAULT_QUERIES_PATH,
+                        help="Path to the corpus JSON to drive. Defaults "
+                             "to data/queries.json. Use "
+                             "data/queries-naive.json for the naive corpus.")
     args = parser.parse_args()
 
     try:
@@ -126,16 +131,35 @@ def main() -> int:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(results, indent=2))
 
-        # Write the .meta.json sidecar next to the server's JSONL so
-        # analyze --corpus can resolve session_id -> shape, place_size,
-        # dataset_family.
+        # Compose .meta.json so analyze --corpus can resolve
+        # session_id -> shape and surface what fraction triggered the
+        # gate. The cost field is left at 0 here because the browser
+        # doesn't see the per-call billing; if you need it, run the
+        # server with --measurement-log and the JSONL has every call.
+        queries_by_id = {q["id"]: q for q in queries}
+        clarify_records = []
+        for r in results:
+            if r["outcome"] != "clarification":
+                continue
+            q = queries_by_id.get(r["query_id"], {})
+            clarify_records.append({
+                "query_id": r["query_id"],
+                "shape": q.get("shape", "unknown"),
+                "place_size": q.get("place_size", "unknown"),
+                "dataset_family": q.get("dataset_family", "unknown"),
+                "missing": q.get("missing"),
+                "clarify_question": r.get("question"),
+                "clarify_cost_usd": 0.0,
+                "clarify_response_id": None,
+            })
         meta_path = args.measurement_log.with_suffix(".meta.json")
         meta_path.parent.mkdir(parents=True, exist_ok=True)
         meta_path.write_text(json.dumps({
-            "spend_usd": 0.0,    # server already logs per-call cost
+            "spend_usd": 0.0,
             "queries": queries,
-            "clarify": [],
+            "clarify": clarify_records,
             "source": "playwright-browser-driver",
+            "corpus_file": str(args.corpus_file),
         }, indent=2))
 
         print()
@@ -150,7 +174,7 @@ def main() -> int:
 
 
 def _select_queries(args: argparse.Namespace) -> list[dict]:
-    raw = json.loads(QUERIES_PATH.read_text())
+    raw = json.loads(args.corpus_file.read_text())
     qs = raw["queries"]
     if args.queries:
         wanted = set(args.queries.split(","))

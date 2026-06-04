@@ -206,7 +206,7 @@ def cmd_run_corpus(args: argparse.Namespace) -> int:
         return 2
     client = OpenAI(api_key=api_key)
     backend = make_backend(args.backend)
-    corpus = load_corpus()
+    corpus = load_corpus(args.corpus_file)
     if args.limit:
         corpus = corpus[: args.limit]
 
@@ -556,6 +556,10 @@ def build_parser() -> argparse.ArgumentParser:
     p6.add_argument("--clarify", action="store_true",
                     help="Run an LLM clarification-gate call before each "
                          "cycle and record its cost separately.")
+    p6.add_argument("--corpus-file", type=Path, default=None,
+                    help="Path to a corpus JSON. Defaults to "
+                         "data/queries.json. Use data/queries-naive.json "
+                         "to stress-test the clarification gate.")
     p6.set_defaults(func=cmd_run_corpus)
 
     p5 = sub.add_parser("serve", help="Run the web UI + map interface")

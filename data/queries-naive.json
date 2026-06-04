@@ -1,0 +1,41 @@
+{
+  "version": "0.1",
+  "description": "Thirty queries representative of casual public traffic: missing dates, missing places, missing dataset hints, colloquial phrasing, meta questions, scope violations. Used to measure how often the LLM clarification gate triggers in realistic public use and what fraction of cycles get to run on the first turn.",
+  "queries": [
+    {"id": "naive-01", "shape": "single_dataset_viz",       "place_size": "city",    "dataset_family": "air_quality",  "missing": "date",    "query": "Show me air quality in Houston"},
+    {"id": "naive-02", "shape": "single_dataset_viz",       "place_size": "state",   "dataset_family": "vegetation",   "missing": "date",    "query": "What does NDVI look like for California"},
+    {"id": "naive-03", "shape": "single_dataset_viz",       "place_size": "region",  "dataset_family": "methane",      "missing": "date",    "query": "Methane levels in the Permian Basin"},
+    {"id": "naive-04", "shape": "single_dataset_viz",       "place_size": "city",    "dataset_family": "air_quality",  "missing": "date",    "query": "NO2 over Delhi please"},
+    {"id": "naive-05", "shape": "single_dataset_viz",       "place_size": "state",   "dataset_family": "precipitation","missing": "date",    "query": "Rainfall in Texas"},
+
+    {"id": "naive-06", "shape": "single_dataset_viz",       "place_size": "unknown", "dataset_family": "air_quality",  "missing": "place",   "query": "Show NO2 data for 2020"},
+    {"id": "naive-07", "shape": "single_dataset_viz",       "place_size": "unknown", "dataset_family": "sst",          "missing": "place",   "query": "Sea surface temperature in August 2023"},
+    {"id": "naive-08", "shape": "time_window_analysis",     "place_size": "unknown", "dataset_family": "vegetation",   "missing": "place",   "query": "NDVI trend from 2010 to 2022"},
+    {"id": "naive-09", "shape": "single_dataset_viz",       "place_size": "unknown", "dataset_family": "snow",         "missing": "place",   "query": "Snow cover last winter"},
+    {"id": "naive-10", "shape": "single_dataset_viz",       "place_size": "unknown", "dataset_family": "methane",      "missing": "place",   "query": "Methane in 2023"},
+
+    {"id": "naive-11", "shape": "single_dataset_viz",       "place_size": "city",    "dataset_family": "unknown",      "missing": "dataset", "query": "Show me data for Los Angeles in 2020"},
+    {"id": "naive-12", "shape": "single_dataset_viz",       "place_size": "country", "dataset_family": "unknown",      "missing": "dataset", "query": "What can you tell me about India in 2021"},
+    {"id": "naive-13", "shape": "single_dataset_viz",       "place_size": "region",  "dataset_family": "unknown",      "missing": "dataset", "query": "Anything for the Amazon in 2022"},
+    {"id": "naive-14", "shape": "single_dataset_viz",       "place_size": "city",    "dataset_family": "unknown",      "missing": "dataset", "query": "Mumbai in 2023"},
+    {"id": "naive-15", "shape": "single_dataset_viz",       "place_size": "state",   "dataset_family": "unknown",      "missing": "dataset", "query": "What's going on in Florida in 2024"},
+
+    {"id": "naive-16", "shape": "single_dataset_viz",       "place_size": "unknown", "dataset_family": "unknown",      "missing": "multiple","query": "What's the weather been like"},
+    {"id": "naive-17", "shape": "single_dataset_viz",       "place_size": "unknown", "dataset_family": "unknown",      "missing": "multiple","query": "Show me a map"},
+    {"id": "naive-18", "shape": "catalog_discovery",        "place_size": "unknown", "dataset_family": "unknown",      "missing": "multiple","query": "What can you do"},
+    {"id": "naive-19", "shape": "single_dataset_viz",       "place_size": "unknown", "dataset_family": "unknown",      "missing": "multiple","query": "Recent satellite data"},
+    {"id": "naive-20", "shape": "single_dataset_viz",       "place_size": "unknown", "dataset_family": "unknown",      "missing": "multiple","query": "How hot has it been"},
+
+    {"id": "naive-21", "shape": "single_dataset_viz",       "place_size": "city",    "dataset_family": "unknown",      "missing": "vague",   "query": "Is the air bad in LA"},
+    {"id": "naive-22", "shape": "single_dataset_viz",       "place_size": "city",    "dataset_family": "unknown",      "missing": "vague",   "query": "Pollution near Beijing"},
+    {"id": "naive-23", "shape": "catalog_discovery",        "place_size": "global",  "dataset_family": "unknown",      "missing": "vague",   "query": "What kind of climate stuff do you have"},
+    {"id": "naive-24", "shape": "single_dataset_viz",       "place_size": "region",  "dataset_family": "vegetation",   "missing": "vague",   "query": "How green is the Sahel these days"},
+    {"id": "naive-25", "shape": "single_dataset_viz",       "place_size": "state",   "dataset_family": "snow",         "missing": "vague",   "query": "Has there been less snow lately in Colorado"},
+
+    {"id": "naive-26", "shape": "single_dataset_viz",       "place_size": "city",    "dataset_family": "air_quality",  "missing": "scope",   "query": "Why is air quality bad in Delhi"},
+    {"id": "naive-27", "shape": "single_dataset_viz",       "place_size": "region",  "dataset_family": "sst",          "missing": "scope",   "query": "What will sea surface temperature look like in 2030"},
+    {"id": "naive-28", "shape": "single_dataset_viz",       "place_size": "city",    "dataset_family": "air_quality",  "missing": "scope",   "query": "Should LA restrict driving on high NO2 days"},
+    {"id": "naive-29", "shape": "single_dataset_viz",       "place_size": "city",    "dataset_family": "air_quality",  "missing": "scope",   "query": "Is climate change affecting Houston"},
+    {"id": "naive-30", "shape": "single_dataset_viz",       "place_size": "unknown", "dataset_family": "unknown",      "missing": "scope",   "query": "What is NDVI"}
+  ]
+}
