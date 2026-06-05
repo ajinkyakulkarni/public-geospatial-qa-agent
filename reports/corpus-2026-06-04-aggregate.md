@@ -110,7 +110,7 @@ ratios in `llm-chat-cost-modeling/verify_numbers.py`.
 ```bash
 git clone https://github.com/ajinkyakulkarni/public-geospatial-qa-agent
 cd public-geospatial-qa-agent
-git checkout 64b7e67696c18672932139b62d5c78f8fda6d0d4
+git checkout a8587b5fd749e6bc8ab0a338fa111c181464969b   # runner state identical to 64b7e67; adds this reports/ file
 pip install -e .
 
 # Start server with measurement + trace logging
