@@ -24,7 +24,13 @@ from openai import OpenAI
 from .archetypes import Archetype
 from .backends import Backend, CannedBackend
 from .cost import GPT_5_2_STANDARD, RateCard, cost_for_call
-from .instrumentation import CallRecord, JsonlLogger, iso_now
+from .instrumentation import (
+    CallRecord,
+    JsonlLogger,
+    TraceLogger,
+    TraceRecord,
+    iso_now,
+)
 from .state import AgentState
 from .tools import make_tools
 
@@ -97,6 +103,7 @@ def run_cycle(
     sysprompt: str | None = None,
     tools: list[dict[str, Any]] | None = None,
     logger: JsonlLogger | None = None,
+    trace_logger: TraceLogger | None = None,
     session_id: str | None = None,
     user_query: str | None = None,
     backend: Backend | None = None,
@@ -160,6 +167,14 @@ def run_cycle(
 
     for stage_idx, stage_name in enumerate(archetype.pipeline, start=1):
         # ── Call OpenAI ────────────────────────────────────────────
+        # Snapshot the messages BEFORE the call so the trace records
+        # exactly what the model saw. messages excludes the system
+        # prompt here because the trace logger stores that once in
+        # its meta sidecar and refers to it by sha256.
+        trace_messages_in = (
+            [dict(m) for m in messages[1:]] if trace_logger else []
+        )
+        t_call_start = time.perf_counter()
         try:
             response = client.chat.completions.create(
                 model=model,
@@ -169,11 +184,10 @@ def run_cycle(
                 extra_body={"prompt_cache_key": prompt_cache_key},
             )
         except Exception as e:
-            # Preserve stages completed so far; the caller decides
-            # whether to retry, render the partial, or escalate.
             trace.error = f"{type(e).__name__} at stage {stage_idx}/{stage_name}: {e}"
             trace.final_state_size_chars = sum(state.snapshot_sizes().values())
             return trace
+        latency_ms = int((time.perf_counter() - t_call_start) * 1000)
 
         usage = response.usage
         prompt_tokens = usage.prompt_tokens
@@ -277,6 +291,379 @@ def run_cycle(
                 openai_response_id=st.openai_response_id,
             ))
 
+        if trace_logger:
+            model_msg = response.choices[0].message
+            model_tool_call = None
+            if getattr(model_msg, "tool_calls", None):
+                tc = model_msg.tool_calls[0]
+                model_tool_call = {
+                    "name": tc.function.name,
+                    "arguments_json": tc.function.arguments,
+                }
+            trace_logger.write(TraceRecord(
+                ts=iso_now(),
+                session_id=session_id,
+                archetype=archetype.id,
+                mode=mode,
+                pattern="single-turn",
+                stage_idx=stage_idx,
+                stage_name=stage_name,
+                user_query=effective_query,
+                model=model,
+                prompt_cache_key=prompt_cache_key,
+                messages_in=trace_messages_in,
+                openai_response_id=st.openai_response_id,
+                assistant_content=(model_msg.content or "") if model_msg else "",
+                assistant_tool_call=model_tool_call,
+                forced_tool_name=stage_name,
+                forced_tool_args_json=json.dumps(tool_args),
+                tool_response_content=tool_message_content,
+                prompt_tokens=prompt_tokens,
+                cached_tokens=cached_tokens,
+                completion_tokens=completion_tokens,
+                call_cost_usd=round(call_cost, 6),
+                cumulative_cost_usd=round(trace.total_cost_usd, 6),
+                latency_ms=latency_ms,
+            ))
+
+    trace.final_state_size_chars = sum(state.snapshot_sizes().values())
+    return trace
+
+
+# Stages whose tool wrapper returns status="pending_confirmation".
+# Used by simulate_per_stage_confirm_cycle to decide which stage
+# transitions get an interstitial confirmation round.
+PENDING_CONFIRMATION_STAGES = frozenset({
+    "parse_datetime",
+    "geocode",
+    "select_collection",
+})
+
+
+CONFIRM_USER_TEXT = "Confirm."
+
+
+def simulate_per_stage_confirm_cycle(
+    client: OpenAI,
+    archetype: Archetype,
+    mode: str,
+    *,
+    model: str = "gpt-5.2",
+    rate: RateCard = GPT_5_2_STANDARD,
+    prompt_cache_key: str = "public-geospatial-qa-agent",
+    sysprompt: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    logger: JsonlLogger | None = None,
+    trace_logger: TraceLogger | None = None,
+    session_id: str | None = None,
+    user_query: str | None = None,
+    backend: Backend | None = None,
+    on_stage: Callable[["Stage", "AgentState"], None] | None = None,
+) -> CycleTrace:
+    """Multi-turn confirmation pattern: the cycle pauses at each input-
+    resolution stage so the user can confirm or correct the parsed
+    value before the pipeline continues.
+
+    Two cost-relevant differences from run_cycle:
+
+    1. Each `parse_datetime`, `geocode`, and `select_collection` stage
+       is followed by an additional OpenAI call that produces the
+       confirmation prose the model would write at a real turn boundary
+       (e.g. "Time set to 2020-01-01/2020-12-31. Confirm to continue.").
+       That call is billed and recorded as its own Stage with idx=N.5
+       so analyze can split the prose cost from the tool-call cost.
+
+    2. After the confirmation prose, a synthetic user "Confirm." message
+       is appended to the history. Subsequent stages see the extended
+       conversation, so cumulative input tokens grow faster than under
+       run_cycle.
+
+    Returns a CycleTrace with the same shape run_cycle returns. The
+    tool-message and state recording semantics are identical, so the
+    per-cycle aggregates from analyze --corpus stack against the
+    single-turn baseline directly.
+    """
+    if sysprompt is None:
+        sysprompt = load_sysprompt()
+    if tools is None:
+        tools = load_tool_schemas()
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+    if backend is None:
+        backend = CannedBackend()
+
+    state = AgentState()
+    tool_wrappers = make_tools(mode, state, backend)
+    effective_query = user_query if user_query is not None else archetype.query
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": sysprompt},
+        {"role": "user", "content": effective_query},
+    ]
+
+    trace = CycleTrace(
+        session_id=session_id,
+        archetype_id=archetype.id,
+        user_query=effective_query,
+        mode=mode,
+    )
+    tool_chars_running = 0
+    derived = _derive_args_from_query(effective_query)
+
+    for stage_idx, stage_name in enumerate(archetype.pipeline, start=1):
+        # ── Stage's tool call (same as run_cycle) ──────────────────
+        trace_messages_in = (
+            [dict(m) for m in messages[1:]] if trace_logger else []
+        )
+        t_call_start = time.perf_counter()
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                extra_body={"prompt_cache_key": prompt_cache_key},
+            )
+        except Exception as e:
+            trace.error = f"{type(e).__name__} at stage {stage_idx}/{stage_name}: {e}"
+            trace.final_state_size_chars = sum(state.snapshot_sizes().values())
+            return trace
+        latency_ms = int((time.perf_counter() - t_call_start) * 1000)
+
+        usage = response.usage
+        prompt_tokens = usage.prompt_tokens
+        cached_tokens = (
+            usage.prompt_tokens_details.cached_tokens
+            if usage.prompt_tokens_details else 0
+        )
+        completion_tokens = usage.completion_tokens
+        call_cost = cost_for_call(
+            rate, prompt_tokens, cached_tokens, completion_tokens
+        )
+
+        tool_method = getattr(tool_wrappers, stage_name)
+        tool_args = _default_args_for_stage(stage_name, archetype, state, derived)
+        tool_message_content = tool_method(**tool_args)
+
+        tool_call_id = f"call_{stage_idx}_{uuid.uuid4().hex[:8]}"
+        messages.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": stage_name,
+                    "arguments": json.dumps(tool_args),
+                },
+            }],
+        })
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": tool_message_content,
+        })
+
+        tool_chars_running += len(tool_message_content)
+        st = Stage(
+            idx=stage_idx,
+            name=stage_name,
+            prompt_tokens=prompt_tokens,
+            cached_tokens=cached_tokens,
+            completion_tokens=completion_tokens,
+            call_cost_usd=call_cost,
+            tool_message_chars=len(tool_message_content),
+            state_size_chars=sum(state.snapshot_sizes().values()),
+            assistant_tool_call_args=json.dumps(tool_args),
+            tool_response_preview=tool_message_content[:200],
+            openai_response_id=getattr(response, "id", "") or "",
+        )
+        trace.stages.append(st)
+        trace.total_prompt_tokens += prompt_tokens
+        trace.total_cached_tokens += cached_tokens
+        trace.total_completion_tokens += completion_tokens
+        trace.total_cost_usd += call_cost
+
+        if on_stage is not None:
+            try:
+                on_stage(st, state)
+            except Exception as e:
+                if trace.error is None:
+                    trace.error = f"on_stage callback raised: {type(e).__name__}: {e}"
+
+        if logger:
+            logger.write(CallRecord(
+                ts=iso_now(),
+                session_id=session_id,
+                archetype=archetype.id,
+                mode=mode,
+                stage_idx=stage_idx,
+                stage_name=stage_name,
+                user_query=archetype.query,
+                prompt_tokens=prompt_tokens,
+                cached_tokens=cached_tokens,
+                completion_tokens=completion_tokens,
+                fresh_input_tokens=max(0, prompt_tokens - cached_tokens),
+                messages_count=len(messages),
+                tool_messages_chars=len(tool_message_content),
+                tool_messages_chars_running=tool_chars_running,
+                state_size_chars=st.state_size_chars,
+                call_cost_usd=round(call_cost, 6),
+                cumulative_cost_usd=round(trace.total_cost_usd, 6),
+                openai_response_id=st.openai_response_id,
+            ))
+
+        if trace_logger:
+            model_msg = response.choices[0].message
+            model_tool_call = None
+            if getattr(model_msg, "tool_calls", None):
+                tc = model_msg.tool_calls[0]
+                model_tool_call = {
+                    "name": tc.function.name,
+                    "arguments_json": tc.function.arguments,
+                }
+            trace_logger.write(TraceRecord(
+                ts=iso_now(),
+                session_id=session_id,
+                archetype=archetype.id,
+                mode=mode,
+                pattern="per-stage-confirm",
+                stage_idx=stage_idx,
+                stage_name=stage_name,
+                user_query=effective_query,
+                model=model,
+                prompt_cache_key=prompt_cache_key,
+                messages_in=trace_messages_in,
+                openai_response_id=st.openai_response_id,
+                assistant_content=(model_msg.content or "") if model_msg else "",
+                assistant_tool_call=model_tool_call,
+                forced_tool_name=stage_name,
+                forced_tool_args_json=json.dumps(tool_args),
+                tool_response_content=tool_message_content,
+                prompt_tokens=prompt_tokens,
+                cached_tokens=cached_tokens,
+                completion_tokens=completion_tokens,
+                call_cost_usd=round(call_cost, 6),
+                cumulative_cost_usd=round(trace.total_cost_usd, 6),
+                latency_ms=latency_ms,
+            ))
+
+        # ── Confirmation round, if this is a pending stage ────────
+        if stage_name not in PENDING_CONFIRMATION_STAGES:
+            continue
+
+        # Ask the model to write the confirmation prose. No tools
+        # available on this call — the model writes plain text, which
+        # is what would actually appear to the user mid-conversation.
+        confirm_messages_in = (
+            [dict(m) for m in messages[1:]] if trace_logger else []
+        )
+        t_confirm_start = time.perf_counter()
+        try:
+            confirm_response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                extra_body={"prompt_cache_key": prompt_cache_key},
+            )
+        except Exception as e:
+            trace.error = (
+                f"{type(e).__name__} at confirmation for stage "
+                f"{stage_idx}/{stage_name}: {e}"
+            )
+            trace.final_state_size_chars = sum(state.snapshot_sizes().values())
+            return trace
+        confirm_latency_ms = int((time.perf_counter() - t_confirm_start) * 1000)
+
+        confirm_usage = confirm_response.usage
+        c_pt = confirm_usage.prompt_tokens
+        c_ct = (
+            confirm_usage.prompt_tokens_details.cached_tokens
+            if confirm_usage.prompt_tokens_details else 0
+        )
+        c_ot = confirm_usage.completion_tokens
+        c_cost = cost_for_call(rate, c_pt, c_ct, c_ot)
+        confirm_prose = confirm_response.choices[0].message.content or ""
+
+        messages.append({"role": "assistant", "content": confirm_prose})
+        messages.append({"role": "user", "content": CONFIRM_USER_TEXT})
+
+        # Record the confirmation prose as its own Stage with a
+        # half-step idx so it stays distinguishable from the tool
+        # stages in the JSONL log.
+        confirm_st = Stage(
+            idx=stage_idx,
+            name=f"{stage_name}__confirm",
+            prompt_tokens=c_pt,
+            cached_tokens=c_ct,
+            completion_tokens=c_ot,
+            call_cost_usd=c_cost,
+            tool_message_chars=0,
+            state_size_chars=sum(state.snapshot_sizes().values()),
+            assistant_tool_call_args="",
+            tool_response_preview=confirm_prose[:200],
+            openai_response_id=getattr(confirm_response, "id", "") or "",
+        )
+        trace.stages.append(confirm_st)
+        trace.total_prompt_tokens += c_pt
+        trace.total_cached_tokens += c_ct
+        trace.total_completion_tokens += c_ot
+        trace.total_cost_usd += c_cost
+
+        if on_stage is not None:
+            try:
+                on_stage(confirm_st, state)
+            except Exception:
+                pass
+
+        if logger:
+            logger.write(CallRecord(
+                ts=iso_now(),
+                session_id=session_id,
+                archetype=archetype.id,
+                mode=mode,
+                stage_idx=stage_idx,
+                stage_name=f"{stage_name}__confirm",
+                user_query=archetype.query,
+                prompt_tokens=c_pt,
+                cached_tokens=c_ct,
+                completion_tokens=c_ot,
+                fresh_input_tokens=max(0, c_pt - c_ct),
+                messages_count=len(messages),
+                tool_messages_chars=0,
+                tool_messages_chars_running=tool_chars_running,
+                state_size_chars=confirm_st.state_size_chars,
+                call_cost_usd=round(c_cost, 6),
+                cumulative_cost_usd=round(trace.total_cost_usd, 6),
+                openai_response_id=confirm_st.openai_response_id,
+            ))
+
+        if trace_logger:
+            trace_logger.write(TraceRecord(
+                ts=iso_now(),
+                session_id=session_id,
+                archetype=archetype.id,
+                mode=mode,
+                pattern="per-stage-confirm",
+                stage_idx=stage_idx,
+                stage_name=f"{stage_name}__confirm",
+                user_query=effective_query,
+                model=model,
+                prompt_cache_key=prompt_cache_key,
+                messages_in=confirm_messages_in,
+                openai_response_id=confirm_st.openai_response_id,
+                assistant_content=confirm_prose,
+                assistant_tool_call=None,
+                forced_tool_name="",
+                forced_tool_args_json="",
+                tool_response_content="",
+                prompt_tokens=c_pt,
+                cached_tokens=c_ct,
+                completion_tokens=c_ot,
+                call_cost_usd=round(c_cost, 6),
+                cumulative_cost_usd=round(trace.total_cost_usd, 6),
+                latency_ms=confirm_latency_ms,
+            ))
+
     trace.final_state_size_chars = sum(state.snapshot_sizes().values())
     return trace
 
@@ -308,8 +695,8 @@ def _default_args_for_stage(
         "collections_rag":  {"query": archetype.query, "top_k": 5},
         "select_collection": {"collection_id": "no2-monthly"},
         "stac_search":      {"collection_id": "no2-monthly", "limit": 15},
-        "stats":            {},
-        "viz":              {},
+        "compute_stats":    {},
+        "build_viz_tiles":  {},
     }[stage_name]
 
 

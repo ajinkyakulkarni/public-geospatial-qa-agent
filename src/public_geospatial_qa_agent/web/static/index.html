@@ -16,6 +16,24 @@
   <header>
     <h1>Public Geospatial Q&amp;A Agent</h1>
     <div class="header-right">
+      <div id="cell-indicator" class="cell-indicator" hidden>
+        mode <b id="mode-label">templated</b>
+        · pattern <b id="pattern-label">single-turn</b>
+      </div>
+      <label class="manual-mode">
+        <span>mode</span>
+        <select id="mode-select">
+          <option value="templated">templated</option>
+          <option value="freeform">freeform</option>
+        </select>
+      </label>
+      <label class="manual-mode">
+        <span>pattern</span>
+        <select id="pattern-select">
+          <option value="single-turn">single-turn</option>
+          <option value="per-stage-confirm">per-stage-confirm</option>
+        </select>
+      </label>
       <label class="clarify-toggle">
         <input id="clarify" type="checkbox" checked />
         <span>Ask before running if unclear</span>

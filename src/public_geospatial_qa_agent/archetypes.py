@@ -29,7 +29,7 @@ DEFAULT_PIPELINE = (
     "collections_rag",
     "select_collection",
     "stac_search",
-    "stats",
+    "compute_stats",
 )
 
 # build_viz_tiles is non-gating and can fire in the same turn as the

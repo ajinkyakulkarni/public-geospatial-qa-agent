@@ -37,8 +37,16 @@ from openai import OpenAI
 from .. import __version__
 from ..archetypes import ALL_ARCHETYPES, archetype_by_id
 from ..backends import make_backend
-from ..instrumentation import JsonlLogger
-from ..runner import llm_clarification_check, needs_clarification, run_cycle
+from ..cost import GPT_5_2_STANDARD
+from ..instrumentation import JsonlLogger, TraceLogger
+from ..runner import (
+    llm_clarification_check,
+    load_sysprompt,
+    load_tool_schemas,
+    needs_clarification,
+    run_cycle,
+    simulate_per_stage_confirm_cycle,
+)
 from .budget import Budget
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -68,6 +76,7 @@ def create_app(
     api_key: str | None = None,
     backend_name: str | None = None,
     measurement_log_path: str | None = None,
+    trace_path: str | None = None,
 ) -> FastAPI:
     """Build the FastAPI app. Exposed as a factory so the Playwright
     tests can construct an app with a stubbed OpenAI client or zero
@@ -80,6 +89,8 @@ def create_app(
         backend_name = os.environ.get("PGQA_BACKEND", "canned")
     if measurement_log_path is None:
         measurement_log_path = os.environ.get("PGQA_MEASUREMENT_LOG") or None
+    if trace_path is None:
+        trace_path = os.environ.get("PGQA_TRACE_LOG") or None
     # Open-once logger so concurrent SSE workers append to the same
     # file. JsonlLogger.write isn't fully thread-safe, but FastAPI's
     # threadpool runs one request per cycle and per-line writes flush
@@ -89,6 +100,26 @@ def create_app(
     if measurement_log_path:
         Path(measurement_log_path).parent.mkdir(parents=True, exist_ok=True)
         measurement_logger = JsonlLogger(measurement_log_path).__enter__()
+    # Optional publish-grade trace logger: writes a richer record per
+    # LLM call plus a `.meta.json` sidecar with the resolved sysprompt
+    # / tool schemas / rate card so the trace is self-contained for
+    # reviewers and downstream validators.
+    trace_logger: TraceLogger | None = None
+    if trace_path:
+        Path(trace_path).parent.mkdir(parents=True, exist_ok=True)
+        trace_logger = TraceLogger(
+            trace_path,
+            sysprompt=load_sysprompt(),
+            tools=load_tool_schemas(),
+            model="gpt-5.2",
+            rate_card={
+                "input_per_million": GPT_5_2_STANDARD.input_per_million,
+                "cached_input_per_million": GPT_5_2_STANDARD.cached_input_per_million,
+                "output_per_million": GPT_5_2_STANDARD.output_per_million,
+            },
+            corpus_file=os.environ.get("PGQA_CORPUS_FILE"),
+            notes=os.environ.get("PGQA_TRACE_NOTES", ""),
+        ).__enter__()
 
     app = FastAPI(
         title="public-geospatial-qa-agent",
@@ -173,6 +204,16 @@ def create_app(
         session_id_hint = body.get("session_id") or None
         prompt_cache_key = f"public-geospatial-qa-agent-{cache_namespace}"
 
+        # Mode + pattern selection. Defaults reproduce the prior
+        # behaviour (templated, single-turn) — these are only set
+        # away from defaults by the corpus driver.
+        mode = body.get("mode") or "templated"
+        if mode not in ("templated", "freeform"):
+            raise HTTPException(400, f"unknown mode {mode!r}")
+        pattern = body.get("pattern") or "single-turn"
+        if pattern not in ("single-turn", "per-stage-confirm"):
+            raise HTTPException(400, f"unknown pattern {pattern!r}")
+
         client = OpenAI(api_key=api_key)
 
         # Clarification mode: if the client opts in via clarify=true,
@@ -208,6 +249,9 @@ def create_app(
                 prompt_cache_key=prompt_cache_key,
                 session_id=session_id_hint,
                 logger=measurement_logger,
+                trace_logger=trace_logger,
+                mode=mode,
+                pattern=pattern,
             ),
             media_type="text/event-stream",
         )
@@ -239,6 +283,9 @@ def _stream_cycle(
     prompt_cache_key: str = "public-geospatial-qa-agent",
     session_id: str | None = None,
     logger: JsonlLogger | None = None,
+    trace_logger: TraceLogger | None = None,
+    mode: str = "templated",
+    pattern: str = "single-turn",
 ):
     """SSE producer. Runs `run_cycle` in a worker thread so the SSE
     handler can drain a queue and push events as they happen.
@@ -272,15 +319,21 @@ def _stream_cycle(
 
     def worker():
         try:
-            trace = run_cycle(
+            cycle_fn = (
+                simulate_per_stage_confirm_cycle
+                if pattern == "per-stage-confirm"
+                else run_cycle
+            )
+            trace = cycle_fn(
                 client,
                 archetype,
-                mode="templated",  # public endpoint is templated-only
+                mode=mode,
                 user_query=user_query,
                 backend=backend,
                 prompt_cache_key=prompt_cache_key,
                 session_id=session_id,
                 logger=logger,
+                trace_logger=trace_logger,
                 on_stage=on_stage,
             )
             budget.settle(trace.total_cost_usd)
@@ -336,7 +389,7 @@ def _map_payload_after_stage(stage, state) -> dict[str, Any]:
             }
             for it in state.stac_result.get("items", [])
         ]
-    elif stage.name == "stats":
+    elif stage.name == "compute_stats":
         payload["stats"] = state.stats_result.get("per_item", [])
     return payload
 

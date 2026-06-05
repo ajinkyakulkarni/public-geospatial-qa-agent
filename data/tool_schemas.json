@@ -2,7 +2,7 @@
   {
     "type": "function",
     "function": {
-      "name": "set_datetime_tool",
+      "name": "parse_datetime",
       "description": "Validate and normalize an ISO-8601 datetime range.",
       "parameters": {
         "type": "object",
@@ -20,7 +20,7 @@
   {
     "type": "function",
     "function": {
-      "name": "get_place_tool",
+      "name": "geocode",
       "description": "Resolve a place name to a bounding box and geometry via geocoding.",
       "parameters": {
         "type": "object",
@@ -38,7 +38,7 @@
   {
     "type": "function",
     "function": {
-      "name": "collections_rag_tool",
+      "name": "collections_rag",
       "description": "Search for relevant STAC collections using semantic search.",
       "parameters": {
         "type": "object",
@@ -60,7 +60,7 @@
   {
     "type": "function",
     "function": {
-      "name": "select_collection_tool",
+      "name": "select_collection",
       "description": "Record the user's collection and optional variable selection.",
       "parameters": {
         "type": "object",
@@ -82,7 +82,7 @@
   {
     "type": "function",
     "function": {
-      "name": "stac_search_tool",
+      "name": "stac_search",
       "description": "Search STAC catalog for COG items. Reads bbox and datetime from state.",
       "parameters": {
         "type": "object",
@@ -104,7 +104,7 @@
   {
     "type": "function",
     "function": {
-      "name": "stats_tool",
+      "name": "compute_stats",
       "description": "Fetch raster zonal statistics. Reads geometry, items, and collection info from state.",
       "parameters": {
         "type": "object",
@@ -116,7 +116,7 @@
   {
     "type": "function",
     "function": {
-      "name": "viz_tool",
+      "name": "build_viz_tiles",
       "description": "Build raster tile URLs for visualization. Reads items and collection info from state.",
       "parameters": {
         "type": "object",

@@ -143,7 +143,7 @@ def test_state_isolation_under_templated_mode():
     llm_chars_total += len(tools.collections_rag("NO2 air quality"))
     llm_chars_total += len(tools.select_collection("no2-monthly"))
     llm_chars_total += len(tools.stac_search("no2-monthly", limit=15))
-    llm_chars_total += len(tools.stats())
+    llm_chars_total += len(tools.compute_stats())
 
     state_sizes = state.snapshot_sizes()
     state_total = sum(state_sizes.values())
@@ -179,6 +179,33 @@ def test_response_templates_load():
 # ---------------------------------------------------------------------
 # Backend protocol — canned implementation
 # ---------------------------------------------------------------------
+
+def test_per_stage_confirm_signature_and_constants():
+    """Verify the per-stage-confirm cycle helper exposes the same
+    surface area as run_cycle so analyze --corpus can read both
+    JSONL outputs the same way, and that the pending-stage constant
+    matches what the sysprompt documents."""
+    from public_geospatial_qa_agent.runner import (
+        simulate_per_stage_confirm_cycle,
+        PENDING_CONFIRMATION_STAGES,
+        CONFIRM_USER_TEXT,
+    )
+    import inspect
+    sig = inspect.signature(simulate_per_stage_confirm_cycle)
+    expected_kwargs = {
+        "client", "archetype", "mode", "model", "rate",
+        "prompt_cache_key", "sysprompt", "tools", "logger",
+        "session_id", "user_query", "backend", "on_stage",
+    }
+    assert expected_kwargs.issubset(sig.parameters.keys())
+    # The three pending stages are exactly the input-resolution
+    # ones the sysprompt names. If sysprompt drifts, this test
+    # forces a deliberate update.
+    assert PENDING_CONFIRMATION_STAGES == frozenset({
+        "parse_datetime", "geocode", "select_collection",
+    })
+    assert CONFIRM_USER_TEXT  # non-empty
+
 
 def test_clarification_rules():
     from public_geospatial_qa_agent.runner import needs_clarification

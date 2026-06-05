@@ -22,8 +22,8 @@
     collections_rag:  "search collections",
     select_collection: "select collection",
     stac_search:      "STAC search",
-    stats:            "compute stats",
-    viz:              "build viz",
+    compute_stats:    "compute stats",
+    build_viz_tiles:  "build viz",
   };
 
   // Color palette for per-turn map overlays. The first user turn is
@@ -250,7 +250,7 @@
     if (ev.name === "stac_search" && p.stac_items) {
       return `${p.stac_items.length} item${p.stac_items.length === 1 ? "" : "s"}`;
     }
-    if (ev.name === "stats" && p.stats) {
+    if (ev.name === "compute_stats" && p.stats) {
       return `${p.stats.length} row${p.stats.length === 1 ? "" : "s"}`;
     }
     return "";
@@ -388,16 +388,29 @@
     const parts = appendAgentBubble(turnIdx);
 
     try {
-      // Measurement runs (the Playwright corpus driver) set
-      // window.PGQA_SESSION_ID before clicking Send so the server's
-      // JSONL log records a stable id tied to the corpus query.
+      // Mode + pattern come from one of three sources, in priority:
+      //   1. Driver-set window vars (the Playwright corpus runner).
+      //   2. Header dropdowns (manual user testing).
+      //   3. Server defaults (templated, single-turn).
       const sessionIdHint = window.PGQA_SESSION_ID || undefined;
+      const modeHint = window.PGQA_MODE || $("mode-select")?.value || undefined;
+      const patternHint = window.PGQA_PATTERN || $("pattern-select")?.value || undefined;
       const body = {
         query: effectiveQuery,
         clarify: clarifyEnabled,
         cache_namespace: sessionKey,
       };
       if (sessionIdHint) body.session_id = sessionIdHint;
+      if (modeHint) body.mode = modeHint;
+      if (patternHint) body.pattern = patternHint;
+      // Reflect the cell in the visible header so the human watching
+      // can see which row of the matrix is being measured.
+      const indicator = $("cell-indicator");
+      if (modeHint || patternHint) {
+        indicator.hidden = false;
+        $("mode-label").textContent = modeHint || "templated";
+        $("pattern-label").textContent = patternHint || "single-turn";
+      }
       const r = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -465,7 +478,11 @@
   /* Reset                                                          */
   /* -------------------------------------------------------------- */
   function resetSession() {
-    if (inFlight) return;
+    // Force-clear the in-flight guard. If a previous turn's SSE
+    // stream is hung (network glitch, server stall), this lets the
+    // next turn proceed instead of leaving Send disabled forever.
+    inFlight = false;
+    $("ask").disabled = false;
     // Drop every chat message except the original welcome bubble.
     const chat = $("chat");
     const welcome = chat.firstElementChild;

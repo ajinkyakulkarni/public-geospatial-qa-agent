@@ -51,6 +51,7 @@ from .runner import (
     load_sysprompt,
     load_tool_schemas,
     run_cycle,
+    simulate_per_stage_confirm_cycle,
 )
 
 
@@ -95,7 +96,7 @@ def cmd_show_config(args: argparse.Namespace) -> int:
             ("collections_rag", {"query": "NO2 air quality", "top_k": 5}),
             ("select_collection", {"collection_id": "no2-monthly"}),
             ("stac_search", {"collection_id": "no2-monthly", "limit": 15}),
-            ("stats", {}),
+            ("compute_stats", {}),
         ]:
             content = getattr(tools, method)(**args)
             n_tok = len(enc.encode(content))
@@ -259,13 +260,22 @@ def cmd_run_corpus(args: argparse.Namespace) -> int:
                     )
                     print(f"{label} (spend so far ${spend:.4f})…")
                     session_id = f"{cq.id}-{mode}-s{sample_idx + 1}"
-                    trace = run_cycle(
-                        client, archetype, mode,
-                        session_id=session_id,
-                        user_query=cq.query,
-                        logger=logger,
-                        backend=backend,
-                    )
+                    if args.pattern == "per-stage-confirm":
+                        trace = simulate_per_stage_confirm_cycle(
+                            client, archetype, mode,
+                            session_id=session_id,
+                            user_query=cq.query,
+                            logger=logger,
+                            backend=backend,
+                        )
+                    else:
+                        trace = run_cycle(
+                            client, archetype, mode,
+                            session_id=session_id,
+                            user_query=cq.query,
+                            logger=logger,
+                            backend=backend,
+                        )
                     spend += trace.total_cost_usd
                     if spend > args.budget:
                         print(f"  !! Budget cap ${args.budget} hit. Stopping.")
@@ -361,12 +371,38 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+_CELL_LABEL_RX = (
+    "tmpl-single-gated",
+    "tmpl-single-nogate",
+    "tmpl-perstage-nogate",
+    "freeform-single-gated",
+    "freeform-single-nogate",
+    "freeform-perstage-nogate",
+)
+
+
+def _parse_cell_label(label: str) -> tuple[str, str, str]:
+    """Return (mode, pattern, gate). Falls back to (label, '', '')
+    when the label doesn't match one of the known cells, which keeps
+    older session_id formats (qid-mode-sN) working."""
+    if label not in _CELL_LABEL_RX:
+        # Old format: label is just the mode ("templated", "freeform").
+        if label in ("templated", "freeform"):
+            return label, "single-turn", "nogate"
+        return label, "", ""
+    mode_part, pattern_part, gate_part = label.split("-", 2)
+    mode = "templated" if mode_part == "tmpl" else "freeform"
+    pattern = "single-turn" if pattern_part == "single" else "per-stage-confirm"
+    gate = "gated" if gate_part == "gated" else "nogate"
+    return mode, pattern, gate
+
+
 def _analyze_corpus(log_path: Path, records: list[dict],
                     args: argparse.Namespace) -> int:
     """Per-axis aggregate report. Mean per-cycle cost + 95% CI broken
-    down by archetype shape, by place_size, and by dataset_family.
-    Emits a Markdown file next to the JSONL so the paper can include
-    it directly."""
+    down by archetype shape, by place_size, by mode, and by cell
+    (when the session_id encodes a cell). Emits a Markdown file
+    next to the JSONL ready to lift into the paper."""
     import statistics
     import math
     from collections import defaultdict
@@ -378,35 +414,49 @@ def _analyze_corpus(log_path: Path, records: list[dict],
         return 1
     meta = json.loads(meta_path.read_text())
     query_meta = {q["id"]: q for q in meta["queries"]}
+    known_qids = sorted(query_meta.keys(), key=len, reverse=True)
 
-    # Each session_id is "<query_id>-<mode>-s<n>". Group records by
-    # session, then sum per-session cost / tokens. Per-session
-    # aggregates are what we average across the corpus.
+    # Group records by session_id, then sum per-session aggregates.
     by_session: dict[str, list[dict]] = defaultdict(list)
     for r in records:
         by_session[r["session_id"]].append(r)
 
     rows = []
     for sid, recs in by_session.items():
-        if "-" not in sid:
+        # session_id formats supported:
+        #   <qid>-<mode>-s<N>                     (early run-corpus)
+        #   <qid>-<cell_label>-s<N>               (matrix runs via browser)
+        # Resolve qid by longest-prefix match against the meta's query
+        # ids, then treat the middle portion as the cell label.
+        qid = None
+        for candidate in known_qids:
+            if sid.startswith(candidate + "-"):
+                qid = candidate
+                break
+        if qid is None:
             continue
-        # session_id shape: <qid>-<mode>-sN
-        parts = sid.rsplit("-", 2)
-        if len(parts) != 3:
+        tail = sid[len(qid) + 1:]   # strip "qid-"
+        cell_label, _, sample = tail.rpartition("-")
+        if not sample.startswith("s"):
             continue
-        qid, mode, _sample = parts
-        if qid not in query_meta:
-            continue
+        # Derive (mode, pattern, gate) from the cell label when it
+        # matches one of the matrix labels; otherwise treat the cell
+        # as "mode" only (back-compat with older runs).
+        mode, pattern, gate = _parse_cell_label(cell_label)
         cycle_cost = sum(r["call_cost_usd"] for r in recs)
         cycle_in = sum(r["prompt_tokens"] for r in recs)
         cycle_cached = sum(r["cached_tokens"] for r in recs)
         cycle_out = sum(r["completion_tokens"] for r in recs)
         qm = query_meta[qid]
         rows.append({
-            "query_id": qid, "mode": mode,
-            "shape": qm["shape"],
-            "place_size": qm["place_size"],
-            "dataset_family": qm["dataset_family"],
+            "query_id": qid,
+            "cell": cell_label,
+            "mode": mode,
+            "pattern": pattern,
+            "gate": gate,
+            "shape": qm.get("shape", "unknown"),
+            "place_size": qm.get("place_size", "unknown"),
+            "dataset_family": qm.get("dataset_family", "unknown"),
             "cycle_cost_usd": cycle_cost,
             "cycle_prompt_tokens": cycle_in,
             "cycle_cached_tokens": cycle_cached,
@@ -429,22 +479,49 @@ def _analyze_corpus(log_path: Path, records: list[dict],
     md.append(f"Total spend: ${meta['spend_usd']:.4f}.")
     md.append("")
 
-    # ---- Table 8: per-shape mean + 95% CI ----
-    md.append("## Per-archetype-shape per-cycle cost (mean ± 95% CI)")
+    # ---- Headline table: per-cell mean cost ± 95% CI ----
+    md.append("## Per-cell per-cycle cost (mean ± 95% CI)")
     md.append("")
-    md.append("| shape | mode | n | cost ($) | cache % | prompt tok | output tok |")
-    md.append("|---|---|---:|---:|---:|---:|---:|")
-    by_shape_mode: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    md.append("Each cell is one cross of (mode, pattern, gate). This is "
+              "the table to lift into the paper.")
+    md.append("")
+    md.append("| mode | pattern | gate | n | cost ($) | cache % | "
+              "prompt tok | output tok |")
+    md.append("|---|---|---|---:|---:|---:|---:|---:|")
+    by_cell: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
     for r in rows:
-        by_shape_mode[(r["shape"], r["mode"])].append(r)
-    for (shape, mode) in sorted(by_shape_mode):
-        rs = by_shape_mode[(shape, mode)]
+        by_cell[(r["mode"], r["pattern"], r["gate"])].append(r)
+    for key in sorted(by_cell):
+        rs = by_cell[key]
         cost_m, cost_ci = mean_ci([r["cycle_cost_usd"] for r in rs])
         cache_m, _ = mean_ci([r["cache_ratio"] for r in rs])
         in_m, _ = mean_ci([float(r["cycle_prompt_tokens"]) for r in rs])
         out_m, _ = mean_ci([float(r["cycle_completion_tokens"]) for r in rs])
+        m, p, g = key
         md.append(
-            f"| {shape} | {mode} | {len(rs)} | "
+            f"| {m} | {p} | {g} | {len(rs)} | "
+            f"{cost_m:.6f} ± {cost_ci:.6f} | {100*cache_m:.1f}% | "
+            f"{in_m:,.0f} | {out_m:,.0f} |"
+        )
+    md.append("")
+
+    # ---- Per-shape × cell ----
+    md.append("## Per-archetype-shape per-cycle cost (mean ± 95% CI)")
+    md.append("")
+    md.append("| shape | mode | pattern | gate | n | cost ($) | cache % | prompt tok | output tok |")
+    md.append("|---|---|---|---|---:|---:|---:|---:|---:|")
+    by_shape_cell: dict[tuple[str, str, str, str], list[dict]] = defaultdict(list)
+    for r in rows:
+        by_shape_cell[(r["shape"], r["mode"], r["pattern"], r["gate"])].append(r)
+    for key in sorted(by_shape_cell):
+        rs = by_shape_cell[key]
+        cost_m, cost_ci = mean_ci([r["cycle_cost_usd"] for r in rs])
+        cache_m, _ = mean_ci([r["cache_ratio"] for r in rs])
+        in_m, _ = mean_ci([float(r["cycle_prompt_tokens"]) for r in rs])
+        out_m, _ = mean_ci([float(r["cycle_completion_tokens"]) for r in rs])
+        sh, m, p, g = key
+        md.append(
+            f"| {sh} | {m} | {p} | {g} | {len(rs)} | "
             f"{cost_m:.6f} ± {cost_ci:.6f} | {100*cache_m:.1f}% | "
             f"{in_m:,.0f} | {out_m:,.0f} |"
         )
@@ -560,6 +637,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Path to a corpus JSON. Defaults to "
                          "data/queries.json. Use data/queries-naive.json "
                          "to stress-test the clarification gate.")
+    p6.add_argument("--pattern", default="single-turn",
+                    choices=["single-turn", "per-stage-confirm"],
+                    help="single-turn: one OpenAI call per stage, fixed "
+                         "sequence (default). per-stage-confirm: each "
+                         "input-resolution stage is followed by a "
+                         "confirmation-prose OpenAI call and a synthetic "
+                         "'Confirm.' user turn, modelling a multi-turn "
+                         "deployment where the user confirms between "
+                         "stages.")
     p6.set_defaults(func=cmd_run_corpus)
 
     p5 = sub.add_parser("serve", help="Run the web UI + map interface")
@@ -576,6 +662,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "call to this path. Off by default because the "
                          "JSONL pairs user_query with response_id; only "
                          "enable on a single-user local server.")
+    p5.add_argument("--trace", type=Path, default=None,
+                    help="Local-use-only: write a publish-grade trace "
+                         "(full messages_in, model response, forced "
+                         "tool args, openai response_id, latency) to "
+                         "this path, plus a .meta.json sidecar with "
+                         "the resolved sysprompt + tool schemas + "
+                         "rate card. Off by default.")
     p5.set_defaults(func=cmd_serve)
 
     return p
@@ -589,6 +682,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if args.measurement_log:
         os.environ["PGQA_MEASUREMENT_LOG"] = str(args.measurement_log)
         print(f"Measurement logging enabled → {args.measurement_log}")
+    if args.trace:
+        os.environ["PGQA_TRACE_LOG"] = str(args.trace)
+        print(f"Trace logging enabled → {args.trace}")
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         print("WARNING: OPENAI_API_KEY not set — /api/ask will 500 until you "

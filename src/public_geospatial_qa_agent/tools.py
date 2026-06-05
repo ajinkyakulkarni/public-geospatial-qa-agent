@@ -124,7 +124,7 @@ class TemplatedTools:
         )
         return build_tool_response(STATUS_COMPLETE, msg, retrieved=actual)
 
-    def stats(self) -> str:
+    def compute_stats(self) -> str:
         items = self.state.stac_result.get("items", [])
         bbox = self.state.place_result.get("bbox") if self.state.place_result else None
         result = self.backend.stats(items, bbox)
@@ -137,7 +137,7 @@ class TemplatedTools:
         )
         return build_tool_response(STATUS_COMPLETE, msg)
 
-    def viz(self) -> str:
+    def build_viz_tiles(self) -> str:
         items = self.state.stac_result.get("items", [])
         collection_id = self.state.selected_collection_id or ""
         result = self.backend.viz(items, collection_id)
@@ -205,8 +205,8 @@ class FreeformTools:
             "matched": self.state.stac_result.get("matched", 0),
         })
 
-    def stats(self) -> str:
-        self._templated.stats()
+    def compute_stats(self) -> str:
+        self._templated.compute_stats()
         return json.dumps({
             "status": STATUS_COMPLETE,
             "message": "Statistics computed — full per-item table below.",
@@ -214,8 +214,8 @@ class FreeformTools:
             "count": self.state.stats_result.get("count", 0),
         })
 
-    def viz(self) -> str:
-        self._templated.viz()
+    def build_viz_tiles(self) -> str:
+        self._templated.build_viz_tiles()
         return json.dumps({
             "status": STATUS_COMPLETE,
             "message": "Visualization layers built — see metadata below.",

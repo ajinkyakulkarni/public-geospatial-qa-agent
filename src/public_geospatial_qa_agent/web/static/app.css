@@ -34,6 +34,16 @@ header h1 {
   align-items: center;
   gap: 16px;
 }
+.cell-indicator {
+  font-family: ui-monospace, SF Mono, monospace;
+  font-size: 11px;
+  background: #2c3a55;
+  border: 1px solid #4a5468;
+  padding: 4px 10px;
+  border-radius: 5px;
+  color: #c5cfdc;
+}
+.cell-indicator b { color: #ffb547; font-weight: 600; }
 .clarify-toggle {
   display: flex;
   align-items: center;
@@ -44,6 +54,25 @@ header h1 {
   user-select: none;
 }
 .clarify-toggle input { margin: 0; }
+.manual-mode {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  opacity: 0.9;
+  font-family: ui-monospace, SF Mono, monospace;
+}
+.manual-mode select {
+  background: #2c3a55;
+  color: #fff;
+  border: 1px solid #4a5468;
+  border-radius: 4px;
+  padding: 2px 4px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.manual-mode select:focus { outline: 1px solid #4a7bd1; }
 .health {
   font-size: 11px;
   opacity: 0.75;
